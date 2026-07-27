@@ -32,6 +32,9 @@ All JSON is one compact, key-sorted UTF-8 record terminated by LF. JUnit has
 one passing case per registered scenario and contains no durations or output
 streams.
 
+`provenance.json` binds the exact CPython, PyTorch, and NumPy versions used by
+the run together with the referenced 40-hex source revision.
+
 ## Observation-to-result binding
 
 Results are derived by the verifier; callers cannot provide result hashes

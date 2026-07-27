@@ -192,6 +192,7 @@ def verify_distribution(
         if (
             "__pycache__" in lowered_parts
             or "torch" in lowered_parts
+            or "numpy" in lowered_parts
             or lowered_name in _FORBIDDEN_NAMES
             or lowered_name.endswith(_FORBIDDEN_SUFFIXES)
         ):

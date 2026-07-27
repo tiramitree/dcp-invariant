@@ -37,6 +37,7 @@ _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _SOURCE_REVISION = re.compile(r"[0-9a-f]{40}\Z")
 _PYTHON_VERSION = re.compile(r"3\.(?:11|12|13)\.[0-9]+\Z")
 _TORCH_VERSION = re.compile(r"2\.11\.0(?:\+cpu)?\Z")
+_NUMPY_VERSION = re.compile(r"2\.4\.6\Z")
 _MANIFEST_LINE = re.compile(r"([0-9a-f]{64})  ([a-z0-9_.\-/]+)\Z")
 _WINDOWS_ABSOLUTE = re.compile(r"(?:\A|[\s\"'=])(?:[A-Za-z]:[\\/]|\\\\)")
 _COMMON_POSIX_ABSOLUTE = re.compile(
@@ -830,6 +831,7 @@ def _build_provenance(
     source_revision: str,
     python_version: str,
     torch_version: str,
+    numpy_version: str,
 ) -> dict[str, Any]:
     if type(source_revision) is not str or not _SOURCE_REVISION.fullmatch(
         source_revision
@@ -841,6 +843,8 @@ def _build_provenance(
         raise EvidenceArtifactError("Python version is outside the registered range")
     if type(torch_version) is not str or not _TORCH_VERSION.fullmatch(torch_version):
         raise EvidenceArtifactError("PyTorch version is outside the registered range")
+    if type(numpy_version) is not str or not _NUMPY_VERSION.fullmatch(numpy_version):
+        raise EvidenceArtifactError("NumPy version is outside the registered range")
     return {
         "artifact_schema": ARTIFACT_SCHEMA,
         "evidence_boundary": {
@@ -854,6 +858,7 @@ def _build_provenance(
         },
         "runtime": {
             "implementation": "CPython",
+            "numpy_version": numpy_version,
             "python_version": python_version,
             "torch_version": torch_version,
         },
@@ -908,7 +913,14 @@ def _validate_provenance(value: object) -> dict[str, Any]:
         raise EvidenceArtifactError("source revision is invalid")
     runtime = _expect_exact_fields(
         provenance["runtime"],
-        frozenset({"implementation", "python_version", "torch_version"}),
+        frozenset(
+            {
+                "implementation",
+                "numpy_version",
+                "python_version",
+                "torch_version",
+            }
+        ),
         "runtime",
     )
     _expect_exact(runtime["implementation"], "CPython", "runtime implementation")
@@ -920,6 +932,10 @@ def _validate_provenance(value: object) -> dict[str, Any]:
         runtime["torch_version"]
     ):
         raise EvidenceArtifactError("PyTorch version is invalid")
+    if type(runtime["numpy_version"]) is not str or not _NUMPY_VERSION.fullmatch(
+        runtime["numpy_version"]
+    ):
+        raise EvidenceArtifactError("NumPy version is invalid")
     expected_registry = [spec.registry_json() for spec in SCENARIO_SPECS]
     if not exact_json_equal(provenance["scenario_registry"], expected_registry):
         raise EvidenceArtifactError("scenario registry is invalid")
@@ -1220,6 +1236,7 @@ def build_evidence_artifact(
     source_revision: str,
     python_version: str,
     torch_version: str,
+    numpy_version: str,
     observations: Mapping[str, Mapping[str, Any]],
 ) -> VerifiedArtifact:
     """Build the exact v1 artifact from validated execution observations."""
@@ -1231,6 +1248,7 @@ def build_evidence_artifact(
         source_revision=source_revision,
         python_version=python_version,
         torch_version=torch_version,
+        numpy_version=numpy_version,
     )
     _validate_provenance(provenance)
     summary = _build_summary(results)

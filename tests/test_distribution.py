@@ -57,6 +57,7 @@ def test_clean_source_only_distribution_passes(tmp_path: Path, suffix: str) -> N
         "package/checkpoint/.metadata",
         "package/checkpoint/__0_0.distcp",
         "package/torch/__init__.py",
+        "package/numpy/__init__.py",
         "package/__pycache__/module.pyc",
     ],
 )

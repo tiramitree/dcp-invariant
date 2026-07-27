@@ -25,6 +25,7 @@ from dcp_invariant.canonical import canonical_json
 SOURCE_REVISION = "a" * 40
 PYTHON_VERSION = "3.12.10"
 TORCH_VERSION = "2.11.0+cpu"
+NUMPY_VERSION = "2.4.6"
 STATE_CONTRACT = hashlib.sha256(b"state-contract").hexdigest()
 COMPONENTS = ("cursor", "model", "optimizer", "rng", "state")
 
@@ -268,6 +269,7 @@ def build(root: Path):
         source_revision=SOURCE_REVISION,
         python_version=PYTHON_VERSION,
         torch_version=TORCH_VERSION,
+        numpy_version=NUMPY_VERSION,
         observations=complete_observations(),
     )
 
@@ -507,6 +509,7 @@ def test_provenance_is_minimal_and_manifest_is_explicitly_unsigned(
     provenance = verified.provenance
     assert provenance["runtime"] == {
         "implementation": "CPython",
+        "numpy_version": NUMPY_VERSION,
         "python_version": PYTHON_VERSION,
         "torch_version": TORCH_VERSION,
     }

@@ -937,6 +937,16 @@ def _validate_runtime_versions(versions: set[str]) -> str:
     return torch_version
 
 
+def _validated_numpy_version() -> str:
+    try:
+        version = importlib.metadata.version("numpy")
+    except importlib.metadata.PackageNotFoundError as error:
+        raise SuiteError("registered NumPy runtime is unavailable") from error
+    if version != "2.4.6":
+        raise SuiteError("NumPy runtime is outside the registered version")
+    return version
+
+
 def _validate_all_state_contracts(
     observations: Mapping[str, Mapping[str, Any]],
 ) -> None:
@@ -1067,6 +1077,7 @@ def run_suite(
         _validate_observation_registry(observations)
         _validate_all_state_contracts(observations)
         torch_version = _validate_runtime_versions(torch_versions)
+        numpy_version = _validated_numpy_version()
 
     native_work_cleaned = (
         native_root is not None
@@ -1081,6 +1092,7 @@ def run_suite(
         source_revision=source_revision,
         python_version=platform.python_version(),
         torch_version=torch_version,
+        numpy_version=numpy_version,
         observations=observations,
     )
     artifact = verify_evidence_artifact(output_root)

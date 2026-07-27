@@ -10,10 +10,10 @@ It asks one bounded question:
 > the same next-step state after a checkpoint is loaded under a different
 > local process count?
 
-The v0.1 target is PyTorch 2.11.0 over single-host CPU/Gloo with one or two
-processes. The suite also checks DTensor global-tensor equality after 1-to-2
-and 2-to-1 resharding, worker-exit promotion gating, missing native files, and
-controlled shard corruption.
+The v0.1 target is PyTorch 2.11.0 with NumPy 2.4.6 over single-host CPU/Gloo
+with one or two processes. The suite also checks DTensor global-tensor equality
+after 1-to-2 and 2-to-1 resharding, worker-exit promotion gating, missing
+native files, and controlled shard corruption.
 
 ## What the suite proves
 
@@ -55,7 +55,7 @@ python -m venv .venv
 Then install the project and the exact official CPU runtime:
 
 ```text
-python -m pip install -e ".[dev]"
+python -m pip install -e ".[dev,runtime]"
 python -m pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cpu
 ```
 
