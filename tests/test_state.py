@@ -1,7 +1,17 @@
 from __future__ import annotations
 
+import subprocess
+import sys
+from pathlib import Path
+
 import torch
 
+from dcp_invariant.canonical import canonical_json, strict_json_loads
+from dcp_invariant.elastic_contract import (
+    BOOTSTRAP_ATTESTATION_NAME,
+    bootstrap_attestation_payload,
+)
+from dcp_invariant.elastic_supervisor import _torchrun_environment
 from dcp_invariant.state import (
     BIAS_SHAPE,
     GLOBAL_BATCH_SHAPE,
@@ -68,3 +78,72 @@ def test_state_contract_digest_is_stable_sha256() -> None:
     digest = state_contract_digest()
     assert len(digest) == 64
     assert digest == state_contract_digest()
+
+
+def test_torchrun_bootstrap_agent_creates_exact_attestation(tmp_path: Path) -> None:
+    attestation = tmp_path / BOOTSTRAP_ATTESTATION_NAME
+    environment = _torchrun_environment(tmp_path, attestation)
+    script = """
+from torch.distributed.elastic.rendezvous import RendezvousParameters
+from torch.distributed.elastic.rendezvous import c10d_rendezvous_backend
+
+params = RendezvousParameters(
+    backend="c10d",
+    endpoint="127.0.0.1:0",
+    run_id="registered-bootstrap-test",
+    min_nodes=1,
+    max_nodes=1,
+    is_host=True,
+    read_timeout=5,
+)
+store = c10d_rendezvous_backend._create_tcp_store(params)
+assert store is not None
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=tmp_path,
+        env=environment,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr.decode(errors="replace")
+    raw = attestation.read_text(encoding="utf-8")
+    expected = bootstrap_attestation_payload(str(torch.__version__))
+    assert raw == canonical_json(expected) + "\n"
+    assert strict_json_loads(raw[:-1]) == expected
+
+
+def test_torchrun_bootstrap_rejects_direct_tcpstore_attestation(
+    tmp_path: Path,
+) -> None:
+    attestation = tmp_path / BOOTSTRAP_ATTESTATION_NAME
+    environment = _torchrun_environment(tmp_path, attestation)
+    script = """
+from datetime import timedelta
+from torch.distributed.elastic.rendezvous import c10d_rendezvous_backend
+
+c10d_rendezvous_backend.TCPStore(
+    "127.0.0.1",
+    0,
+    is_master=True,
+    multi_tenant=True,
+    timeout=timedelta(seconds=5),
+)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=tmp_path,
+        env=environment,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert (
+        "TCPStore call did not originate from _create_tcp_store"
+        in result.stderr.decode(errors="replace")
+    )
+    assert not attestation.exists()

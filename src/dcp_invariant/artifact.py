@@ -17,13 +17,24 @@ from pathlib import Path
 from typing import Any
 
 from .canonical import canonical_json, exact_json_equal, sha256_json, strict_json_loads
+from .elastic_contract import (
+    BOOTSTRAP_ATTESTATION_SCHEMA,
+    BOOTSTRAP_ID,
+    ELASTIC_REPORT_SCHEMA,
+    FAILURE_MARKER_SCHEMA,
+    REGISTERED_MAX_RESTARTS,
+    REGISTERED_WORLD_SIZE,
+    bootstrap_attestation_payload,
+    failure_marker_payload,
+)
 
-ARTIFACT_SCHEMA = "dcp-invariant-evidence-v1"
-RESULT_SCHEMA = "dcp-invariant-scenario-result-v1"
-SUMMARY_SCHEMA = "dcp-invariant-summary-v1"
+ARTIFACT_SCHEMA = "dcp-invariant-evidence-v2"
+RESULT_SCHEMA = "dcp-invariant-scenario-result-v2"
+SUMMARY_SCHEMA = "dcp-invariant-summary-v2"
 TRAINING_OBSERVATION_SCHEMA = "dcp-invariant-training-observation-v1"
 DTENSOR_OBSERVATION_SCHEMA = "dcp-invariant-dtensor-observation-v1"
 FAULT_OBSERVATION_SCHEMA = "dcp-invariant-fault-observation-v1"
+ELASTIC_OBSERVATION_SCHEMA = "dcp-invariant-elastic-observation-v2"
 WORKER_REPORT_SCHEMA = "dcp-invariant-worker-report-v1"
 LATEST_SCHEMA = "dcp-invariant-latest-v1"
 MANIFEST_NAME = "manifest.sha256"
@@ -117,6 +128,12 @@ SCENARIO_SPECS = (
     ScenarioSpec("training_2_to_1", "training-exact-state", 2, 1),
     ScenarioSpec("training_2_to_2", "training-exact-state", 2, 2),
     ScenarioSpec(
+        "elastic_restart_2_to_2",
+        "elastic-restart-exact-state",
+        2,
+        2,
+    ),
+    ScenarioSpec(
         "rank_exit_no_promotion",
         "fault-rejection",
         2,
@@ -158,6 +175,11 @@ _DTENSOR_SCENARIOS = frozenset(
     spec.name
     for spec in SCENARIO_SPECS
     if spec.category == "dtensor-exact-global-tensor"
+)
+_ELASTIC_SCENARIOS = frozenset(
+    spec.name
+    for spec in SCENARIO_SPECS
+    if spec.category == "elastic-restart-exact-state"
 )
 _FAULT_SCENARIOS = frozenset(
     spec.name for spec in SCENARIO_SPECS if spec.category == "fault-rejection"
@@ -621,6 +643,323 @@ def _validate_dtensor_observation(
     return normalized, result
 
 
+def _validate_elastic_bootstrap(value: object) -> tuple[dict[str, Any], str]:
+    fields = frozenset(
+        {
+            "attestation_schema",
+            "attestation_sha256",
+            "backend_module",
+            "bootstrap_id",
+            "create_tcp_store_call_verified",
+            "forced_use_libuv",
+            "shared_rendezvous_tcpstore_disabled",
+            "source_sha256",
+            "tcpstore_created",
+            "torch_version",
+        }
+    )
+    bootstrap = _expect_exact_fields(value, fields, "torchrun bootstrap")
+    torch_version = bootstrap["torch_version"]
+    if (
+        type(torch_version) is not str
+        or _TORCH_VERSION.fullmatch(torch_version) is None
+    ):
+        raise EvidenceArtifactError("torchrun bootstrap runtime is invalid")
+    expected = bootstrap_attestation_payload(torch_version)
+    for field, expected_value in expected.items():
+        _expect_exact(
+            bootstrap[field],
+            expected_value,
+            f"torchrun bootstrap {field}",
+        )
+    _expect_exact(
+        bootstrap["attestation_schema"],
+        BOOTSTRAP_ATTESTATION_SCHEMA,
+        "torchrun bootstrap schema",
+    )
+    digest = _require_sha256(
+        bootstrap["attestation_sha256"],
+        "torchrun bootstrap attestation",
+    )
+    raw = (canonical_json(expected) + "\n").encode("utf-8")
+    if digest != hashlib.sha256(raw).hexdigest():
+        raise EvidenceArtifactError("torchrun bootstrap digest is invalid")
+    return bootstrap, digest
+
+
+def _validate_elastic_failure(value: object) -> tuple[dict[str, Any], str]:
+    fields = frozenset(
+        {
+            "injected_exit_code",
+            "marker_schema",
+            "marker_sha256",
+            "injected_rank",
+            "injection_restart_count",
+            "world_size",
+        }
+    )
+    failure = _expect_exact_fields(value, fields, "elastic failure")
+    expected = failure_marker_payload()
+    for field, expected_value in expected.items():
+        _expect_exact(failure[field], expected_value, f"elastic failure {field}")
+    _expect_exact(
+        failure["marker_schema"],
+        FAILURE_MARKER_SCHEMA,
+        "elastic failure marker schema",
+    )
+    marker_sha256 = _require_sha256(
+        failure["marker_sha256"],
+        "elastic failure marker",
+    )
+    marker_raw = (canonical_json(expected) + "\n").encode("utf-8")
+    if marker_sha256 != hashlib.sha256(marker_raw).hexdigest():
+        raise EvidenceArtifactError("elastic failure marker digest is invalid")
+    return failure, marker_sha256
+
+
+def _validate_elastic_reports(
+    value: object,
+    *,
+    failure_marker_sha256: str,
+) -> list[dict[str, Any]]:
+    if type(value) is not list or len(value) != REGISTERED_WORLD_SIZE:
+        raise EvidenceArtifactError("elastic control report set is incomplete")
+    fields = frozenset(
+        {
+            "elastic_report_schema",
+            "failure_marker_sha256",
+            "loopback_rendezvous",
+            "max_restarts",
+            "rank",
+            "restart_count",
+            "shared_rendezvous_tcpstore_disabled",
+            "world_size",
+        }
+    )
+    reports: list[dict[str, Any]] = []
+    for rank, value_report in enumerate(value):
+        report = _expect_exact_fields(
+            value_report,
+            fields,
+            f"elastic rank {rank} report",
+        )
+        _expect_exact(
+            report["elastic_report_schema"],
+            ELASTIC_REPORT_SCHEMA,
+            "elastic report schema",
+        )
+        _expect_exact(report["rank"], rank, "elastic rank")
+        _expect_exact(
+            report["loopback_rendezvous"],
+            True,
+            "elastic loopback rendezvous",
+        )
+        _expect_exact(
+            report["world_size"],
+            REGISTERED_WORLD_SIZE,
+            "elastic world size",
+        )
+        _expect_exact(report["restart_count"], 1, "elastic restart count")
+        _expect_exact(
+            report["shared_rendezvous_tcpstore_disabled"],
+            True,
+            "elastic shared rendezvous TCPStore opt-out",
+        )
+        _expect_exact(
+            report["max_restarts"],
+            REGISTERED_MAX_RESTARTS,
+            "elastic max restarts",
+        )
+        _expect_exact(
+            report["failure_marker_sha256"],
+            failure_marker_sha256,
+            "elastic failure marker",
+        )
+        reports.append(report)
+    _require_report_consensus(
+        reports,
+        {
+            "elastic_report_schema",
+            "failure_marker_sha256",
+            "loopback_rendezvous",
+            "max_restarts",
+            "restart_count",
+            "shared_rendezvous_tcpstore_disabled",
+            "world_size",
+        },
+    )
+    return reports
+
+
+def _validate_elastic_observation(
+    value: object,
+    spec: ScenarioSpec,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    fields = frozenset(
+        {
+            "bootstrap",
+            "checkpoint_id",
+            "elastic_reports",
+            "failure",
+            "launcher",
+            "load_reports",
+            "max_restarts",
+            "observation_schema",
+            "promotion_pointer_after",
+            "promotion_pointer_before",
+            "receipt_sha256_after_restart",
+            "receipt_sha256_before_restart",
+            "receipt_verified_after_load",
+            "receipt_verified_after_promotion",
+            "restart_count",
+            "save_reports",
+            "save_worker",
+            "scenario",
+            "source_world_size",
+            "target_world_size",
+        }
+    )
+    observation = _expect_exact_fields(value, fields, spec.name)
+    _expect_exact(
+        observation["observation_schema"],
+        ELASTIC_OBSERVATION_SCHEMA,
+        "elastic observation schema",
+    )
+    _expect_exact(observation["scenario"], spec.name, "scenario")
+    _expect_exact(
+        observation["source_world_size"],
+        REGISTERED_WORLD_SIZE,
+        "elastic source world size",
+    )
+    _expect_exact(
+        observation["target_world_size"],
+        REGISTERED_WORLD_SIZE,
+        "elastic target world size",
+    )
+    _expect_exact(
+        observation["checkpoint_id"],
+        "checkpoint-one",
+        "elastic checkpoint identifier",
+    )
+    _expect_exact(
+        observation["max_restarts"],
+        REGISTERED_MAX_RESTARTS,
+        "elastic max restarts",
+    )
+    _expect_exact(observation["restart_count"], 1, "elastic restart count")
+    launcher = _expect_exact_fields(
+        observation["launcher"],
+        frozenset({"exit_code", "timed_out"}),
+        "elastic launcher",
+    )
+    _expect_exact(launcher["exit_code"], 0, "elastic launcher exit code")
+    _expect_exact(launcher["timed_out"], False, "elastic launcher timeout")
+    _validate_worker_outcome(
+        observation["save_worker"],
+        world_size=REGISTERED_WORLD_SIZE,
+        label="elastic save worker",
+    )
+
+    receipt_before = _require_sha256(
+        observation["receipt_sha256_before_restart"],
+        "checkpoint receipt before restart",
+    )
+    receipt_after = _require_sha256(
+        observation["receipt_sha256_after_restart"],
+        "checkpoint receipt after restart",
+    )
+    if receipt_before != receipt_after:
+        raise EvidenceArtifactError("checkpoint receipt changed during elastic restart")
+    receipt = receipt_before
+    pointer_before = _validate_pointer(
+        observation["promotion_pointer_before"],
+        "promotion pointer before elastic restart",
+    )
+    pointer_after = _validate_pointer(
+        observation["promotion_pointer_after"],
+        "promotion pointer after elastic restart",
+    )
+    if not exact_json_equal(pointer_before, pointer_after):
+        raise EvidenceArtifactError("promotion pointer changed during elastic restart")
+    if pointer_before["generation"] != receipt:
+        raise EvidenceArtifactError(
+            "elastic promotion generation does not match receipt"
+        )
+    _expect_exact(
+        observation["receipt_verified_after_promotion"],
+        True,
+        "receipt verification after promotion",
+    )
+    _expect_exact(
+        observation["receipt_verified_after_load"],
+        True,
+        "receipt verification after elastic load",
+    )
+
+    _, bootstrap_sha256 = _validate_elastic_bootstrap(observation["bootstrap"])
+    _, marker_sha256 = _validate_elastic_failure(observation["failure"])
+    _validate_elastic_reports(
+        observation["elastic_reports"],
+        failure_marker_sha256=marker_sha256,
+    )
+    save_reports = _training_reports(
+        observation["save_reports"],
+        action="training-save-baseline",
+        world_size=REGISTERED_WORLD_SIZE,
+        digest_prefixes=("checkpoint", "next"),
+    )
+    load_reports = _training_reports(
+        observation["load_reports"],
+        action="training-load-next",
+        world_size=REGISTERED_WORLD_SIZE,
+        digest_prefixes=("loaded", "next"),
+    )
+    if (
+        save_reports[0]["state_contract_sha256"]
+        != load_reports[0]["state_contract_sha256"]
+    ):
+        raise EvidenceArtifactError("elastic save and load state contracts differ")
+    for component in _STATE_COMPONENTS:
+        if (
+            save_reports[0][f"checkpoint_{component}_sha256"]
+            != load_reports[0][f"loaded_{component}_sha256"]
+        ):
+            raise EvidenceArtifactError(
+                f"elastic checkpoint and loaded {component} states differ"
+            )
+        if (
+            save_reports[0][f"next_{component}_sha256"]
+            != load_reports[0][f"next_{component}_sha256"]
+        ):
+            raise EvidenceArtifactError(
+                f"elastic baseline and resumed next {component} states differ"
+            )
+
+    normalized = strict_json_loads(canonical_json(observation))
+    result = {
+        "bootstrap_attestation_sha256": bootstrap_sha256,
+        "checkpoint_state_sha256": save_reports[0]["checkpoint_state_sha256"],
+        "committed_generation_reused": True,
+        "contract_status": "pass",
+        "failure_marker_sha256": marker_sha256,
+        "loaded_state_sha256": load_reports[0]["loaded_state_sha256"],
+        "max_restarts": REGISTERED_MAX_RESTARTS,
+        "observation_sha256": sha256_json(normalized),
+        "post_failure_promotion_attempted": False,
+        "promotion_allowed": True,
+        "receipt_sha256": receipt,
+        "reference_state_sha256": save_reports[0]["next_state_sha256"],
+        "restart_count": 1,
+        "result_schema": RESULT_SCHEMA,
+        "resumed_state_sha256": load_reports[0]["next_state_sha256"],
+        "scenario": spec.name,
+        "source_world_size": spec.source_world_size,
+        "target_world_size": spec.target_world_size,
+        "torchrun_bootstrap_id": BOOTSTRAP_ID,
+    }
+    return normalized, result
+
+
 def _validate_fault_pointer_pair(observation: Mapping[str, Any]) -> None:
     before = _validate_pointer(
         observation["promotion_pointer_before"],
@@ -799,6 +1138,8 @@ def normalize_observation(
         observation, result = _validate_training_observation(value, spec)
     elif spec.name in _DTENSOR_SCENARIOS:
         observation, result = _validate_dtensor_observation(value, spec)
+    elif spec.name in _ELASTIC_SCENARIOS:
+        observation, result = _validate_elastic_observation(value, spec)
     else:
         observation, result = _validate_fault_observation(value, spec)
     _assert_no_sensitive_shape(observation)
@@ -943,11 +1284,26 @@ def _validate_provenance(value: object) -> dict[str, Any]:
     return provenance
 
 
+def _validate_bootstrap_runtime_alignment(
+    observations: Mapping[str, Mapping[str, Any]],
+    provenance: Mapping[str, Any],
+) -> None:
+    bootstrap_version = observations["elastic_restart_2_to_2"]["bootstrap"][
+        "torch_version"
+    ]
+    provenance_version = provenance["runtime"]["torch_version"]
+    if bootstrap_version != provenance_version:
+        raise EvidenceArtifactError(
+            "torchrun bootstrap and provenance PyTorch versions differ"
+        )
+
+
 def _build_summary(
     results: Mapping[str, Mapping[str, Any]],
 ) -> dict[str, Any]:
     return {
         "artifact_schema": SUMMARY_SCHEMA,
+        "elastic_recoveries": len(_ELASTIC_SCENARIOS),
         "fault_rejections": len(_FAULT_SCENARIOS),
         "global_tensor_equalities": len(_DTENSOR_SCENARIOS),
         "overall_status": "pass",
@@ -1239,7 +1595,7 @@ def build_evidence_artifact(
     numpy_version: str,
     observations: Mapping[str, Mapping[str, Any]],
 ) -> VerifiedArtifact:
-    """Build the exact v1 artifact from validated execution observations."""
+    """Build the exact v2 artifact from validated execution observations."""
 
     if not isinstance(root, Path):
         raise EvidenceArtifactError("artifact root must be a pathlib.Path")
@@ -1251,6 +1607,7 @@ def build_evidence_artifact(
         numpy_version=numpy_version,
     )
     _validate_provenance(provenance)
+    _validate_bootstrap_runtime_alignment(normalized_observations, provenance)
     summary = _build_summary(results)
     _validate_summary(summary, results)
     try:
@@ -1306,6 +1663,7 @@ def verify_evidence_artifact(root: Path) -> VerifiedArtifact:
         for scenario in REGISTERED_SCENARIOS
     }
     observations, derived_results = _validate_observations(parsed_observations)
+    _validate_bootstrap_runtime_alignment(observations, provenance)
     parsed_results = {
         scenario: _parse_canonical_json_bytes(
             payloads[f"results/{scenario}.json"],

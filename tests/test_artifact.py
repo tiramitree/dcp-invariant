@@ -10,6 +10,7 @@ import pytest
 import dcp_invariant.artifact as artifact_module
 from dcp_invariant.artifact import (
     DTENSOR_OBSERVATION_SCHEMA,
+    ELASTIC_OBSERVATION_SCHEMA,
     FAULT_OBSERVATION_SCHEMA,
     LATEST_SCHEMA,
     MANIFEST_NAME,
@@ -21,6 +22,12 @@ from dcp_invariant.artifact import (
     verify_evidence_artifact,
 )
 from dcp_invariant.canonical import canonical_json
+from dcp_invariant.elastic_contract import (
+    BOOTSTRAP_ID,
+    ELASTIC_REPORT_SCHEMA,
+    bootstrap_attestation_payload,
+    failure_marker_payload,
+)
 
 SOURCE_REVISION = "a" * 40
 PYTHON_VERSION = "3.12.10"
@@ -187,6 +194,61 @@ def dtensor_observation(
     }
 
 
+def elastic_observation() -> dict[str, object]:
+    scenario = "elastic_restart_2_to_2"
+    receipt = digest(f"{scenario}-receipt")
+    promotion = pointer(receipt)
+    marker = failure_marker_payload()
+    marker_sha256 = hashlib.sha256((canonical_json(marker) + "\n").encode()).hexdigest()
+    bootstrap = bootstrap_attestation_payload(TORCH_VERSION)
+    bootstrap_sha256 = hashlib.sha256(
+        (canonical_json(bootstrap) + "\n").encode()
+    ).hexdigest()
+    elastic_reports = [
+        {
+            "elastic_report_schema": ELASTIC_REPORT_SCHEMA,
+            "failure_marker_sha256": marker_sha256,
+            "loopback_rendezvous": True,
+            "max_restarts": 1,
+            "rank": rank,
+            "restart_count": 1,
+            "shared_rendezvous_tcpstore_disabled": True,
+            "world_size": 2,
+        }
+        for rank in range(2)
+    ]
+    return {
+        "bootstrap": {**bootstrap, "attestation_sha256": bootstrap_sha256},
+        "checkpoint_id": "checkpoint-one",
+        "elastic_reports": elastic_reports,
+        "failure": {**marker, "marker_sha256": marker_sha256},
+        "launcher": {"exit_code": 0, "timed_out": False},
+        "load_reports": training_reports(
+            scenario=scenario,
+            action="training-load-next",
+            world_size=2,
+        ),
+        "max_restarts": 1,
+        "observation_schema": ELASTIC_OBSERVATION_SCHEMA,
+        "promotion_pointer_after": promotion,
+        "promotion_pointer_before": promotion,
+        "receipt_sha256_after_restart": receipt,
+        "receipt_sha256_before_restart": receipt,
+        "receipt_verified_after_load": True,
+        "receipt_verified_after_promotion": True,
+        "restart_count": 1,
+        "save_reports": training_reports(
+            scenario=scenario,
+            action="training-save-baseline",
+            world_size=2,
+        ),
+        "save_worker": worker_outcome(2),
+        "scenario": scenario,
+        "source_world_size": 2,
+        "target_world_size": 2,
+    }
+
+
 def rank_exit_observation() -> dict[str, object]:
     prior = pointer(digest("prior-generation"))
     return {
@@ -256,6 +318,7 @@ def complete_observations() -> dict[str, dict[str, object]]:
         "training_1_to_2": training_observation("training_1_to_2", 1, 2),
         "training_2_to_1": training_observation("training_2_to_1", 2, 1),
         "training_2_to_2": training_observation("training_2_to_2", 2, 2),
+        "elastic_restart_2_to_2": elastic_observation(),
         "rank_exit_no_promotion": rank_exit_observation(),
         "missing_metadata": receipt_fault_observation("missing_metadata"),
         "missing_shard": receipt_fault_observation("missing_shard"),
@@ -317,10 +380,12 @@ def test_round_trip_binds_observations_results_and_fixed_inventory(
     assert created == verified
     assert set(verified.observations) == set(REGISTERED_SCENARIOS)
     assert set(verified.results) == set(REGISTERED_SCENARIOS)
-    assert verified.summary["passed_scenarios"] == 10
+    assert verified.summary["passed_scenarios"] == 11
     assert verified.summary["state_equalities"] == 4
+    assert verified.summary["elastic_recoveries"] == 1
     assert verified.summary["global_tensor_equalities"] == 2
     assert verified.summary["fault_rejections"] == 4
+    assert verified.summary["promotion_allowed_scenarios"] == 7
     assert set(path.name for path in root.iterdir()) == {
         "junit.xml",
         MANIFEST_NAME,
@@ -346,6 +411,19 @@ def test_results_are_derived_from_observations_not_caller_hashes(
         == hashlib.sha256(
             canonical_json(verified.observations["training_1_to_2"]).encode()
         ).hexdigest()
+    )
+    elastic = verified.results["elastic_restart_2_to_2"]
+    assert elastic["promotion_allowed"] is True
+    assert elastic["committed_generation_reused"] is True
+    assert elastic["post_failure_promotion_attempted"] is False
+    assert elastic["torchrun_bootstrap_id"] == BOOTSTRAP_ID
+    assert (
+        elastic["bootstrap_attestation_sha256"]
+        == (
+            verified.observations["elastic_restart_2_to_2"]["bootstrap"][
+                "attestation_sha256"
+            ]
+        )
     )
 
 
@@ -390,6 +468,78 @@ def test_training_observation_rejects_incomplete_or_unequal_rank_evidence(
     value = training_observation("training_1_to_1", 1, 1)
     mutation(value)
     with pytest.raises(EvidenceArtifactError, match=message):
+        normalize_observation(value)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (
+            lambda value: value.__setitem__("restart_count", 0),
+            "restart count",
+        ),
+        (
+            lambda value: value["elastic_reports"][0].__setitem__("restart_count", 0),
+            "restart count",
+        ),
+        (
+            lambda value: value["failure"].__setitem__("marker_sha256", "b" * 64),
+            "marker digest",
+        ),
+        (
+            lambda value: value["bootstrap"].__setitem__(
+                "attestation_sha256", "b" * 64
+            ),
+            "bootstrap digest",
+        ),
+        (
+            lambda value: value["bootstrap"].__setitem__(
+                "shared_rendezvous_tcpstore_disabled", False
+            ),
+            "shared_rendezvous_tcpstore_disabled",
+        ),
+        (
+            lambda value: value["elastic_reports"][0].__setitem__(
+                "shared_rendezvous_tcpstore_disabled", False
+            ),
+            "shared rendezvous TCPStore opt-out",
+        ),
+        (
+            lambda value: value["elastic_reports"][0].__setitem__(
+                "loopback_rendezvous", False
+            ),
+            "loopback rendezvous",
+        ),
+        (
+            lambda value: value.__setitem__(
+                "promotion_pointer_after", pointer(digest("changed"))
+            ),
+            "pointer changed",
+        ),
+    ],
+)
+def test_elastic_observation_rejects_fabricated_restart_evidence(
+    mutation,
+    message: str,
+) -> None:
+    value = elastic_observation()
+    mutation(value)
+    with pytest.raises(EvidenceArtifactError, match=message):
+        normalize_observation(value)
+
+
+def test_elastic_observation_requires_exact_resumed_state() -> None:
+    value = elastic_observation()
+    for report in value["load_reports"]:
+        report["next_state_sha256"] = "b" * 64
+    with pytest.raises(EvidenceArtifactError, match="resumed next state"):
+        normalize_observation(value)
+
+
+def test_elastic_observation_requires_stable_receipt() -> None:
+    value = elastic_observation()
+    value["receipt_sha256_after_restart"] = "b" * 64
+    with pytest.raises(EvidenceArtifactError, match="receipt changed"):
         normalize_observation(value)
 
 
@@ -468,6 +618,53 @@ def test_resealed_observation_semantic_tampering_is_rejected(tmp_path: Path) -> 
     rewrite_json(target, observation)
     reseal(root)
     with pytest.raises(EvidenceArtifactError, match="next model"):
+        verify_evidence_artifact(root)
+
+
+def test_builder_rejects_bootstrap_provenance_runtime_mismatch(
+    tmp_path: Path,
+) -> None:
+    observations = complete_observations()
+    bootstrap = bootstrap_attestation_payload("2.11.0")
+    observations["elastic_restart_2_to_2"]["bootstrap"] = {
+        **bootstrap,
+        "attestation_sha256": hashlib.sha256(
+            (canonical_json(bootstrap) + "\n").encode()
+        ).hexdigest(),
+    }
+    root = tmp_path / "evidence"
+    with pytest.raises(EvidenceArtifactError, match="PyTorch versions differ"):
+        build_evidence_artifact(
+            root,
+            source_revision=SOURCE_REVISION,
+            python_version=PYTHON_VERSION,
+            torch_version=TORCH_VERSION,
+            numpy_version=NUMPY_VERSION,
+            observations=observations,
+        )
+    assert not root.exists()
+
+
+def test_resealed_coordinated_bootstrap_runtime_tampering_is_rejected(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "evidence"
+    build(root)
+    observation_path = root / "observations" / "elastic_restart_2_to_2.json"
+    result_path = root / "results" / "elastic_restart_2_to_2.json"
+    observation = json.loads(observation_path.read_text(encoding="utf-8"))
+    bootstrap = bootstrap_attestation_payload("2.11.0")
+    observation["bootstrap"] = {
+        **bootstrap,
+        "attestation_sha256": hashlib.sha256(
+            (canonical_json(bootstrap) + "\n").encode()
+        ).hexdigest(),
+    }
+    normalized, derived_result = normalize_observation(observation)
+    rewrite_json(observation_path, normalized)
+    rewrite_json(result_path, derived_result)
+    reseal(root)
+    with pytest.raises(EvidenceArtifactError, match="PyTorch versions differ"):
         verify_evidence_artifact(root)
 
 

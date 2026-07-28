@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from .artifact import (
+    ELASTIC_OBSERVATION_SCHEMA,
     REGISTERED_SCENARIOS,
     VerifiedArtifact,
     build_evidence_artifact,
@@ -34,6 +35,17 @@ from .checkpoint_receipt import (
     CheckpointReceiptError,
     verify_checkpoint,
 )
+from .elastic_contract import (
+    BOOTSTRAP_ATTESTATION_NAME,
+    CONTROL_REPORT_DIRECTORY_NAME,
+    FAILURE_MARKER_NAME,
+    LOAD_REPORT_DIRECTORY_NAME,
+    REGISTERED_MAX_RESTARTS,
+    REGISTERED_WORLD_SIZE,
+    bootstrap_attestation_payload,
+    failure_marker_payload,
+)
+from .elastic_supervisor import ElasticResult, run_elastic_workers
 from .supervisor import (
     LATEST_SCHEMA,
     SupervisorError,
@@ -101,6 +113,7 @@ _DTENSOR_LOAD_FIELDS = _COMMON_REPORT_FIELDS | frozenset(
 )
 
 RankExitRunner = Callable[[Path, Path, float], WorkerResult]
+ElasticRunner = Callable[[Path, Path, Path, Path, Path, float], ElasticResult]
 
 
 class SuiteError(RuntimeError):
@@ -927,6 +940,267 @@ def _run_rank_exit_fault(
     }
 
 
+def default_elastic_runner(
+    cwd: Path,
+    isolated_home: Path,
+    load_report_dir: Path,
+    control_report_dir: Path,
+    failure_marker: Path,
+    timeout_seconds: float,
+) -> ElasticResult:
+    return run_elastic_workers(
+        cwd=cwd,
+        isolated_home=isolated_home,
+        load_report_dir=load_report_dir,
+        control_report_dir=control_report_dir,
+        failure_marker=failure_marker,
+        timeout_seconds=timeout_seconds,
+    )
+
+
+def _read_elastic_control_reports(
+    root: Path,
+    *,
+    failure_marker_sha256: str,
+) -> list[dict[str, Any]]:
+    _ordinary_directory(root, "elastic control report directory")
+    try:
+        entries = {entry.name: entry for entry in root.iterdir()}
+    except OSError as error:
+        raise SuiteError("elastic control report directory cannot be read") from error
+    expected = {f"rank-{rank}.json" for rank in range(REGISTERED_WORLD_SIZE)}
+    if set(entries) != expected:
+        raise SuiteError("elastic control rank set is incomplete or contains extras")
+    reports: list[dict[str, Any]] = []
+    fields = {
+        "elastic_report_schema",
+        "failure_marker_sha256",
+        "loopback_rendezvous",
+        "max_restarts",
+        "rank",
+        "restart_count",
+        "shared_rendezvous_tcpstore_disabled",
+        "world_size",
+    }
+    for rank in range(REGISTERED_WORLD_SIZE):
+        report = _read_canonical_object(
+            entries[f"rank-{rank}.json"],
+            _REPORT_MAX_BYTES,
+            "elastic control report",
+        )
+        if set(report) != fields:
+            raise SuiteError("elastic control report field set is invalid")
+        _require_exact(
+            report["elastic_report_schema"],
+            "dcp-invariant-elastic-report-v2",
+            "elastic report schema",
+        )
+        _require_exact_int(report["rank"], rank, "elastic rank")
+        _require_exact(
+            report["loopback_rendezvous"],
+            True,
+            "elastic loopback rendezvous",
+        )
+        _require_exact_int(
+            report["world_size"],
+            REGISTERED_WORLD_SIZE,
+            "elastic world size",
+        )
+        _require_exact_int(
+            report["restart_count"],
+            1,
+            "elastic restart count",
+        )
+        _require_exact(
+            report["shared_rendezvous_tcpstore_disabled"],
+            True,
+            "elastic shared rendezvous TCPStore opt-out",
+        )
+        _require_exact_int(
+            report["max_restarts"],
+            REGISTERED_MAX_RESTARTS,
+            "elastic max restarts",
+        )
+        _require_exact(
+            report["failure_marker_sha256"],
+            failure_marker_sha256,
+            "elastic failure marker",
+        )
+        reports.append(report)
+    reference = dict(reports[0])
+    reference.pop("rank")
+    candidate = dict(reports[1])
+    candidate.pop("rank")
+    if not exact_json_equal(reference, candidate):
+        raise SuiteError("elastic ranks do not report one restart outcome")
+    return reports
+
+
+def _read_failure_marker(path: Path) -> tuple[dict[str, Any], str]:
+    if path.name != FAILURE_MARKER_NAME:
+        raise SuiteError("elastic failure marker name is invalid")
+    marker = _read_canonical_object(
+        path,
+        _REPORT_MAX_BYTES,
+        "elastic failure marker",
+    )
+    expected = failure_marker_payload()
+    if not exact_json_equal(marker, expected):
+        raise SuiteError("elastic failure marker is invalid")
+    digest = _hash_regular_file(
+        path,
+        _REPORT_MAX_BYTES,
+        "elastic failure marker",
+    )
+    return marker, digest
+
+
+def _read_bootstrap_attestation(
+    path: Path,
+    *,
+    torch_version: str,
+) -> dict[str, Any]:
+    if path.name != BOOTSTRAP_ATTESTATION_NAME:
+        raise SuiteError("torchrun bootstrap attestation name is invalid")
+    attestation = _read_canonical_object(
+        path,
+        _REPORT_MAX_BYTES,
+        "torchrun bootstrap attestation",
+    )
+    expected = bootstrap_attestation_payload(torch_version)
+    if not exact_json_equal(attestation, expected):
+        raise SuiteError("torchrun bootstrap attestation is invalid")
+    digest = _hash_regular_file(
+        path,
+        _REPORT_MAX_BYTES,
+        "torchrun bootstrap attestation",
+    )
+    return {**attestation, "attestation_sha256": digest}
+
+
+def _run_elastic_scenario(
+    root: Path,
+    *,
+    timeout_seconds: float,
+    runner: ElasticRunner,
+) -> tuple[dict[str, Any], str]:
+    scenario = "elastic_restart_2_to_2"
+    layout = _make_promotion_layout(root)
+    save_result, save_reports = _run_action(
+        action="training-save-baseline",
+        checkpoint_id=_CHECKPOINT_ONE,
+        world_size=REGISTERED_WORLD_SIZE,
+        cwd=layout.wrapper,
+        isolated_home=layout.worker_home,
+        report_root=layout.reports / "save",
+        timeout_seconds=timeout_seconds,
+    )
+    state_contract = _require_sha256(
+        save_reports[0]["state_contract_sha256"],
+        "state contract",
+    )
+    candidate_checkpoint = layout.wrapper / _CHECKPOINT_ONE
+    receipt, receipt_sha256 = _verified_receipt(
+        candidate_checkpoint,
+        checkpoint_id=_CHECKPOINT_ONE,
+        expected_state_contract=state_contract,
+    )
+    torch_version = receipt["torch_version"]
+    verifier = _promotion_verifier(
+        checkpoint_id=_CHECKPOINT_ONE,
+        state_contract_sha256=state_contract,
+        torch_version=torch_version,
+        receipt_sha256=receipt_sha256,
+    )
+    promoted_wrapper = promote_candidate(
+        root=layout.root,
+        candidate=layout.wrapper,
+        logical_checkpoint_id=_CHECKPOINT_ONE,
+        verify=verifier,
+    )
+    pointer_before = _read_normalized_pointer(layout.root)
+    if pointer_before["generation"] != receipt_sha256:
+        raise SuiteError("elastic promotion pointer is not bound to the receipt")
+
+    load_report_dir = layout.reports / LOAD_REPORT_DIRECTORY_NAME
+    control_report_dir = layout.reports / CONTROL_REPORT_DIRECTORY_NAME
+    load_report_dir.mkdir()
+    control_report_dir.mkdir()
+    failure_marker = layout.root / FAILURE_MARKER_NAME
+    elastic_result = runner(
+        promoted_wrapper,
+        layout.worker_home,
+        load_report_dir,
+        control_report_dir,
+        failure_marker,
+        timeout_seconds,
+    )
+    if (
+        elastic_result.timed_out
+        or elastic_result.exit_code != 0
+        or elastic_result.tree_cleanup != "normal-agent-exit"
+    ):
+        raise SuiteError("elastic launcher did not complete by normal agent exit")
+
+    bootstrap = _read_bootstrap_attestation(
+        layout.root / BOOTSTRAP_ATTESTATION_NAME,
+        torch_version=torch_version,
+    )
+    marker, marker_sha256 = _read_failure_marker(failure_marker)
+    load_reports = _read_reports(
+        load_report_dir,
+        action="training-load-next",
+        world_size=REGISTERED_WORLD_SIZE,
+    )
+    elastic_reports = _read_elastic_control_reports(
+        control_report_dir,
+        failure_marker_sha256=marker_sha256,
+    )
+    _compare_training_reports(save_reports, load_reports)
+
+    promoted_checkpoint = promoted_wrapper / _CHECKPOINT_ONE
+    post_load_receipt, post_load_sha256 = _verified_receipt(
+        promoted_checkpoint,
+        checkpoint_id=_CHECKPOINT_ONE,
+        expected_state_contract=state_contract,
+        expected_torch_version=torch_version,
+    )
+    if post_load_sha256 != receipt_sha256 or not exact_json_equal(
+        post_load_receipt, receipt
+    ):
+        raise SuiteError("checkpoint changed during elastic trusted load")
+    pointer_after = _read_normalized_pointer(layout.root)
+    if not exact_json_equal(pointer_before, pointer_after):
+        raise SuiteError("promotion pointer changed during elastic restart")
+
+    observation = {
+        "bootstrap": bootstrap,
+        "checkpoint_id": _CHECKPOINT_ONE,
+        "elastic_reports": elastic_reports,
+        "failure": {**marker, "marker_sha256": marker_sha256},
+        "launcher": {
+            "exit_code": elastic_result.exit_code,
+            "timed_out": elastic_result.timed_out,
+        },
+        "load_reports": load_reports,
+        "max_restarts": REGISTERED_MAX_RESTARTS,
+        "observation_schema": ELASTIC_OBSERVATION_SCHEMA,
+        "promotion_pointer_after": pointer_after,
+        "promotion_pointer_before": pointer_before,
+        "receipt_sha256_after_restart": post_load_sha256,
+        "receipt_sha256_before_restart": receipt_sha256,
+        "receipt_verified_after_load": True,
+        "receipt_verified_after_promotion": True,
+        "restart_count": 1,
+        "save_reports": save_reports,
+        "save_worker": _worker_observation(save_result),
+        "scenario": scenario,
+        "source_world_size": REGISTERED_WORLD_SIZE,
+        "target_world_size": REGISTERED_WORLD_SIZE,
+    }
+    return observation, torch_version
+
+
 def _validate_runtime_versions(versions: set[str]) -> str:
     if len(versions) != 1:
         raise SuiteError("scenarios did not use one exact PyTorch runtime")
@@ -988,8 +1262,9 @@ def run_suite(
     source_revision: str,
     timeout_seconds: float = 180.0,
     rank_exit_runner: RankExitRunner | None = None,
+    elastic_runner: ElasticRunner | None = None,
 ) -> SuiteRun:
-    """Run all ten registered scenarios and create one offline artifact.
+    """Run all eleven registered scenarios and create one offline artifact.
 
     ``output_root`` must start absent.  No public file is created until the
     temporary native-checkpoint tree has been removed successfully.
@@ -1003,10 +1278,12 @@ def run_suite(
         source_revision
     ):
         raise SuiteError("source revision must be one lowercase 40-hex value")
-    if not (0.1 <= timeout_seconds <= 300.0):
+    if not (1.0 <= timeout_seconds <= 300.0):
         raise SuiteError("suite timeout is outside the registered bound")
     if rank_exit_runner is None:
         rank_exit_runner = default_rank_exit_runner
+    if elastic_runner is None:
+        elastic_runner = default_elastic_runner
     _ensure_ordinary_output_parent(output_root)
 
     observations: dict[str, dict[str, Any]] = {}
@@ -1037,6 +1314,14 @@ def run_suite(
             )
             observations[scenario] = observation
             torch_versions.add(torch_version)
+
+        elastic_observation, elastic_torch_version = _run_elastic_scenario(
+            native_root / "elastic_restart_2_to_2",
+            timeout_seconds=timeout_seconds,
+            runner=elastic_runner,
+        )
+        observations["elastic_restart_2_to_2"] = elastic_observation
+        torch_versions.add(elastic_torch_version)
 
         for source_world_size, target_world_size in ((1, 2), (2, 1)):
             scenario = f"dtensor_{source_world_size}_to_{target_world_size}"

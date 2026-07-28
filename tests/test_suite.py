@@ -146,6 +146,15 @@ def test_injected_rank_exit_preserves_candidate_and_pointer(
     )
 
 
+def test_suite_rejects_subsecond_timeout_at_entry(tmp_path: Path) -> None:
+    with pytest.raises(SuiteError, match="timeout"):
+        run_suite(
+            tmp_path / "evidence",
+            source_revision="a" * 40,
+            timeout_seconds=0.5,
+        )
+
+
 def test_output_root_must_start_absent(tmp_path: Path) -> None:
     output = tmp_path / "evidence"
     output.mkdir()
@@ -180,10 +189,14 @@ def test_live_registered_suite_has_no_native_public_files(tmp_path: Path) -> Non
     )
 
     assert result.native_work_cleaned is True
-    assert result.artifact.summary["passed_scenarios"] == 10
-    assert len(result.observations) == 10
+    assert result.artifact.summary["passed_scenarios"] == 11
+    assert len(result.observations) == 11
     assert not [
         path
         for path in output.rglob("*")
-        if path.is_file() and (path.name == ".metadata" or path.suffix == ".distcp")
+        if path.is_file()
+        and (
+            path.name in {".elastic-failure.json", ".metadata"}
+            or path.suffix == ".distcp"
+        )
     ]

@@ -1,6 +1,6 @@
 # Contributing
 
-DCPInvariant is pre-release and owner-operated. Reproductions and narrowly
+DCPInvariant is pre-alpha and owner-operated. Reproductions and narrowly
 scoped bug reports are welcome through this repository's GitHub issue tracker.
 
 Before proposing a change:
