@@ -26,6 +26,7 @@ from .elastic_contract import (
     REGISTERED_WORLD_SIZE,
     bootstrap_attestation_payload,
     failure_marker_payload,
+    is_registered_torch_version_pair,
 )
 
 ARTIFACT_SCHEMA = "dcp-invariant-evidence-v2"
@@ -655,17 +656,36 @@ def _validate_elastic_bootstrap(value: object) -> tuple[dict[str, Any], str]:
             "shared_rendezvous_tcpstore_disabled",
             "source_sha256",
             "tcpstore_created",
+            "torch_distribution_version",
             "torch_version",
         }
     )
     bootstrap = _expect_exact_fields(value, fields, "torchrun bootstrap")
+    torch_distribution_version = bootstrap["torch_distribution_version"]
     torch_version = bootstrap["torch_version"]
+    if (
+        type(torch_distribution_version) is not str
+        or _TORCH_VERSION.fullmatch(torch_distribution_version) is None
+    ):
+        raise EvidenceArtifactError(
+            "torchrun bootstrap distribution version is invalid"
+        )
     if (
         type(torch_version) is not str
         or _TORCH_VERSION.fullmatch(torch_version) is None
     ):
         raise EvidenceArtifactError("torchrun bootstrap runtime is invalid")
-    expected = bootstrap_attestation_payload(torch_version)
+    if not is_registered_torch_version_pair(
+        torch_distribution_version,
+        torch_version,
+    ):
+        raise EvidenceArtifactError(
+            "torchrun bootstrap distribution/runtime pair is invalid"
+        )
+    expected = bootstrap_attestation_payload(
+        torch_distribution_version=torch_distribution_version,
+        torch_version=torch_version,
+    )
     for field, expected_value in expected.items():
         _expect_exact(
             bootstrap[field],

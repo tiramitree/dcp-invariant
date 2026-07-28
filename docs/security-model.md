@@ -59,9 +59,11 @@ PyTorch 2.11.0 Windows CPU builds may lack libuv while the standalone c10d
 rendezvous path still defaults to it. The elastic supervisor does not inherit a
 user `PYTHONPATH`; it supplies one package-owned bootstrap directory only to
 the exact torchrun subprocess. Before changing anything, that bootstrap
-requires exact torch 2.11.0 metadata/runtime, an exact registered source digest
-for `_create_tcp_store`, and the pristine c10d-module `TCPStore` reference. It
-then replaces only that module reference and forces `use_libuv=False`. The
+accepts only the registered distribution/runtime pairs
+`2.11.0`/`2.11.0+cpu` and `2.11.0+cpu`/`2.11.0+cpu`. It also requires the exact
+registered source digest for `_create_tcp_store` and the pristine c10d-module
+`TCPStore` reference, then replaces only that module reference and forces
+`use_libuv=False`. The
 replacement rejects every call unless the module still binds the guarded exact
 `_create_tcp_store` function and the immediate caller frame is that function.
 The private attestation is written only after the underlying TCPStore
@@ -75,8 +77,10 @@ control reports expose only `loopback_rendezvous:true`, never the address or
 port. Inherited workers identify the complete fixed rank-coordinate
 environment and no-op before importing torch. The suite requires the
 exclusive canonical private attestation's exact content and digest, and the
-attested torch version must equal the public provenance runtime version. The
-public artifact carries only normalized fixed fields and the digest. A
+attested torch distribution version is preserved as a normalized public field,
+and the attested runtime version must equal the public provenance runtime
+version. The public artifact carries only normalized fixed fields and the
+digest. A
 missing, stale, altered, wrong-version, wrong-source, or wrong-caller
 attestation stops publication.
 

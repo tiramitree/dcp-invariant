@@ -31,6 +31,7 @@ from dcp_invariant.elastic_contract import (
 
 SOURCE_REVISION = "a" * 40
 PYTHON_VERSION = "3.12.10"
+TORCH_DISTRIBUTION_VERSION = "2.11.0"
 TORCH_VERSION = "2.11.0+cpu"
 NUMPY_VERSION = "2.4.6"
 STATE_CONTRACT = hashlib.sha256(b"state-contract").hexdigest()
@@ -200,7 +201,10 @@ def elastic_observation() -> dict[str, object]:
     promotion = pointer(receipt)
     marker = failure_marker_payload()
     marker_sha256 = hashlib.sha256((canonical_json(marker) + "\n").encode()).hexdigest()
-    bootstrap = bootstrap_attestation_payload(TORCH_VERSION)
+    bootstrap = bootstrap_attestation_payload(
+        torch_distribution_version=TORCH_DISTRIBUTION_VERSION,
+        torch_version=TORCH_VERSION,
+    )
     bootstrap_sha256 = hashlib.sha256(
         (canonical_json(bootstrap) + "\n").encode()
     ).hexdigest()
@@ -624,47 +628,46 @@ def test_resealed_observation_semantic_tampering_is_rejected(tmp_path: Path) -> 
 def test_builder_rejects_bootstrap_provenance_runtime_mismatch(
     tmp_path: Path,
 ) -> None:
-    observations = complete_observations()
-    bootstrap = bootstrap_attestation_payload("2.11.0")
-    observations["elastic_restart_2_to_2"]["bootstrap"] = {
-        **bootstrap,
-        "attestation_sha256": hashlib.sha256(
-            (canonical_json(bootstrap) + "\n").encode()
-        ).hexdigest(),
-    }
     root = tmp_path / "evidence"
     with pytest.raises(EvidenceArtifactError, match="PyTorch versions differ"):
         build_evidence_artifact(
             root,
             source_revision=SOURCE_REVISION,
             python_version=PYTHON_VERSION,
-            torch_version=TORCH_VERSION,
+            torch_version="2.11.0",
             numpy_version=NUMPY_VERSION,
-            observations=observations,
+            observations=complete_observations(),
         )
     assert not root.exists()
 
 
-def test_resealed_coordinated_bootstrap_runtime_tampering_is_rejected(
+def test_resealed_coordinated_unregistered_torch_pair_is_rejected(
     tmp_path: Path,
 ) -> None:
     root = tmp_path / "evidence"
     build(root)
     observation_path = root / "observations" / "elastic_restart_2_to_2.json"
-    result_path = root / "results" / "elastic_restart_2_to_2.json"
+    provenance_path = root / "provenance.json"
     observation = json.loads(observation_path.read_text(encoding="utf-8"))
-    bootstrap = bootstrap_attestation_payload("2.11.0")
+    bootstrap = dict(observation["bootstrap"])
+    bootstrap.pop("attestation_sha256")
+    bootstrap["torch_distribution_version"] = "2.11.0"
+    bootstrap["torch_version"] = "2.11.0"
     observation["bootstrap"] = {
         **bootstrap,
         "attestation_sha256": hashlib.sha256(
             (canonical_json(bootstrap) + "\n").encode()
         ).hexdigest(),
     }
-    normalized, derived_result = normalize_observation(observation)
-    rewrite_json(observation_path, normalized)
-    rewrite_json(result_path, derived_result)
+    provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    provenance["runtime"]["torch_version"] = "2.11.0"
+    rewrite_json(observation_path, observation)
+    rewrite_json(provenance_path, provenance)
     reseal(root)
-    with pytest.raises(EvidenceArtifactError, match="PyTorch versions differ"):
+    with pytest.raises(
+        EvidenceArtifactError,
+        match="distribution/runtime pair is invalid",
+    ):
         verify_evidence_artifact(root)
 
 

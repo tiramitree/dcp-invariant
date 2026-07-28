@@ -75,8 +75,10 @@ The elastic observation additionally requires:
   `use_libuv=False` from an invocation whose immediate caller frame and current
   module binding both matched the registered `_create_tcp_store` function. The
   exact shared-rendezvous-store opt-out was fixed to true and repeated by both
-  final worker control reports. The attested torch version must equal the
-  provenance runtime version;
+  final worker control reports. The normalized attestation records the guarded
+  `torch_distribution_version`; the attested runtime version must equal the
+  provenance runtime version, and the distribution/runtime pair must be one
+  of the two registered CPU pairs;
 - a fixed `loopback_rendezvous:true` in both final control reports, derived
   from worker-side numeric-IP parsing and loopback validation of the actual
   rendezvous environment without publishing its address or port;

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.metadata
 import subprocess
 import sys
 from pathlib import Path
@@ -110,7 +111,10 @@ assert store is not None
     )
     assert result.returncode == 0, result.stderr.decode(errors="replace")
     raw = attestation.read_text(encoding="utf-8")
-    expected = bootstrap_attestation_payload(str(torch.__version__))
+    expected = bootstrap_attestation_payload(
+        torch_distribution_version=importlib.metadata.version("torch"),
+        torch_version=str(torch.__version__),
+    )
     assert raw == canonical_json(expected) + "\n"
     assert strict_json_loads(raw[:-1]) == expected
 

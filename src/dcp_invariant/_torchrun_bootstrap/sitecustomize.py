@@ -17,6 +17,7 @@ from dcp_invariant.elastic_contract import (
     BOOTSTRAP_SHARED_STORE_ENV,
     EXPECTED_C10D_CREATE_TCP_STORE_SHA256,
     bootstrap_attestation_payload,
+    is_registered_torch_version_pair,
 )
 
 
@@ -45,14 +46,18 @@ def _attestation_path() -> Path:
     return path
 
 
-def _guard_exact_source(torch, c10d_rendezvous_backend) -> str:
+def _guard_exact_source(torch, c10d_rendezvous_backend) -> tuple[str, str]:
     if os.environ.get(BOOTSTRAP_SHARED_STORE_ENV) != "1":
         raise RuntimeError("torchrun shared rendezvous store opt-out is absent")
-    if importlib.metadata.version("torch") != "2.11.0":
-        raise RuntimeError("torchrun bootstrap requires exact torch metadata 2.11.0")
+    torch_distribution_version = importlib.metadata.version("torch")
     torch_version = str(torch.__version__)
-    if torch_version not in {"2.11.0", "2.11.0+cpu"}:
-        raise RuntimeError("torchrun bootstrap requires exact torch runtime 2.11.0")
+    if not is_registered_torch_version_pair(
+        torch_distribution_version,
+        torch_version,
+    ):
+        raise RuntimeError(
+            "torchrun bootstrap requires a registered torch distribution/runtime pair"
+        )
     if c10d_rendezvous_backend.TCPStore is not torch.distributed.TCPStore:
         raise RuntimeError("torchrun c10d TCPStore reference is not pristine")
     create_tcp_store = c10d_rendezvous_backend._create_tcp_store
@@ -67,7 +72,7 @@ def _guard_exact_source(torch, c10d_rendezvous_backend) -> str:
         or hashlib.sha256(source).hexdigest() != EXPECTED_C10D_CREATE_TCP_STORE_SHA256
     ):
         raise RuntimeError("torchrun c10d TCPStore source is not registered")
-    return torch_version
+    return torch_distribution_version, torch_version
 
 
 def _tcp_store_without_libuv(*args, **kwargs):
@@ -84,7 +89,10 @@ def _tcp_store_without_libuv(*args, **kwargs):
     kwargs["use_libuv"] = False
     store = _ORIGINAL_TCP_STORE(*args, **kwargs)
     del caller
-    payload = bootstrap_attestation_payload(_TORCH_VERSION)
+    payload = bootstrap_attestation_payload(
+        torch_distribution_version=_TORCH_DISTRIBUTION_VERSION,
+        torch_version=_TORCH_VERSION,
+    )
     raw = (
         json.dumps(payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
         + "\n"
@@ -109,13 +117,17 @@ def _install_agent_bootstrap() -> None:
     global _C10D_RENDEZVOUS_BACKEND
     global _ORIGINAL_CREATE_TCP_STORE
     global _ORIGINAL_TCP_STORE
+    global _TORCH_DISTRIBUTION_VERSION
     global _TORCH_VERSION
 
     import torch
     from torch.distributed.elastic.rendezvous import c10d_rendezvous_backend
 
     _ATTESTATION_PATH = _attestation_path()
-    _TORCH_VERSION = _guard_exact_source(torch, c10d_rendezvous_backend)
+    (
+        _TORCH_DISTRIBUTION_VERSION,
+        _TORCH_VERSION,
+    ) = _guard_exact_source(torch, c10d_rendezvous_backend)
     _ORIGINAL_TCP_STORE = c10d_rendezvous_backend.TCPStore
     _ORIGINAL_CREATE_TCP_STORE = c10d_rendezvous_backend._create_tcp_store
     _C10D_RENDEZVOUS_BACKEND = c10d_rendezvous_backend

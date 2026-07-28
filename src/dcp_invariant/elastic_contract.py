@@ -17,10 +17,16 @@ CONTROL_REPORT_DIRECTORY_NAME = "elastic-control"
 BOOTSTRAP_ATTESTATION_NAME = ".torchrun-bootstrap-attestation.json"
 BOOTSTRAP_ATTESTATION_ENV = "DCP_INVARIANT_TORCHRUN_BOOTSTRAP_ATTESTATION"
 BOOTSTRAP_SHARED_STORE_ENV = "TORCH_DISABLE_SHARE_RDZV_TCP_STORE"
-BOOTSTRAP_ATTESTATION_SCHEMA = "dcp-invariant-torchrun-bootstrap-attestation-v2"
-BOOTSTRAP_ID = "torch-2.11-c10d-call-verified-no-libuv-v2"
+BOOTSTRAP_ATTESTATION_SCHEMA = "dcp-invariant-torchrun-bootstrap-attestation-v3"
+BOOTSTRAP_ID = "torch-2.11-c10d-call-verified-no-libuv-v3"
 EXPECTED_C10D_CREATE_TCP_STORE_SHA256 = (
     "488aee8200995402157248d051fc337c9dd02b77dc460ddb9abd2b5bf22bc19f"
+)
+REGISTERED_TORCH_VERSION_PAIRS = frozenset(
+    {
+        ("2.11.0", "2.11.0+cpu"),
+        ("2.11.0+cpu", "2.11.0+cpu"),
+    }
 )
 
 
@@ -98,9 +104,30 @@ def failure_marker_payload() -> dict[str, object]:
     }
 
 
-def bootstrap_attestation_payload(torch_version: str) -> dict[str, object]:
-    if torch_version not in {"2.11.0", "2.11.0+cpu"}:
-        raise ElasticContractError("torchrun bootstrap runtime is not registered")
+def is_registered_torch_version_pair(
+    torch_distribution_version: object,
+    torch_version: object,
+) -> bool:
+    return (
+        type(torch_distribution_version) is str
+        and type(torch_version) is str
+        and (torch_distribution_version, torch_version)
+        in REGISTERED_TORCH_VERSION_PAIRS
+    )
+
+
+def bootstrap_attestation_payload(
+    *,
+    torch_distribution_version: str,
+    torch_version: str,
+) -> dict[str, object]:
+    if not is_registered_torch_version_pair(
+        torch_distribution_version,
+        torch_version,
+    ):
+        raise ElasticContractError(
+            "torchrun bootstrap distribution/runtime pair is not registered"
+        )
     return {
         "attestation_schema": BOOTSTRAP_ATTESTATION_SCHEMA,
         "backend_module": (
@@ -112,5 +139,6 @@ def bootstrap_attestation_payload(torch_version: str) -> dict[str, object]:
         "shared_rendezvous_tcpstore_disabled": True,
         "source_sha256": EXPECTED_C10D_CREATE_TCP_STORE_SHA256,
         "tcpstore_created": True,
+        "torch_distribution_version": torch_distribution_version,
         "torch_version": torch_version,
     }

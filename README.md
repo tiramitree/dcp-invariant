@@ -42,9 +42,10 @@ the attempt-zero rank exit vector.
 
 For the exact PyTorch 2.11.0 runtime, the supervisor injects a package-owned
 startup directory only into this torchrun agent. Its fail-closed compatibility
-guard verifies the exact torch metadata/runtime, the registered
-`_create_tcp_store` source digest, and the pristine module-local `TCPStore`
-reference before forcing only that c10d reference to `use_libuv=False`. The
+guard accepts only the registered distribution/runtime pairs
+`2.11.0`/`2.11.0+cpu` and `2.11.0+cpu`/`2.11.0+cpu`, verifies the registered
+`_create_tcp_store` source digest and pristine module-local `TCPStore`
+reference, then forces only that c10d reference to `use_libuv=False`. The
 replacement rejects calls unless the module still binds the exact guarded
 `_create_tcp_store` function and the immediate caller frame is that function.
 Only after the underlying TCPStore constructor returns does it write a private
@@ -56,8 +57,9 @@ failure mechanism unchanged. The fixed `--local-addr=127.0.0.1` parameter and
 worker-side numeric-IP validation keep the worker rendezvous inside the
 registered loopback contract. Torchrun workers detect their fixed rank
 coordinates and skip the bootstrap. The public observation contains only the
-attestation's fixed fields and digest, and its torch version must equal the
-provenance runtime version.
+attestation's fixed fields and digest, including the guarded torch
+distribution version; its torch runtime version must equal the provenance
+runtime version.
 
 Training evidence binds every rank report and every model, optimizer, RNG, and
 cursor component digest. It requires both the checkpoint state and the next

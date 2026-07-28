@@ -44,6 +44,7 @@ from .elastic_contract import (
     REGISTERED_WORLD_SIZE,
     bootstrap_attestation_payload,
     failure_marker_payload,
+    is_registered_torch_version_pair,
 )
 from .elastic_supervisor import ElasticResult, run_elastic_workers
 from .supervisor import (
@@ -1058,6 +1059,7 @@ def _read_failure_marker(path: Path) -> tuple[dict[str, Any], str]:
 def _read_bootstrap_attestation(
     path: Path,
     *,
+    torch_distribution_version: str,
     torch_version: str,
 ) -> dict[str, Any]:
     if path.name != BOOTSTRAP_ATTESTATION_NAME:
@@ -1067,7 +1069,10 @@ def _read_bootstrap_attestation(
         _REPORT_MAX_BYTES,
         "torchrun bootstrap attestation",
     )
-    expected = bootstrap_attestation_payload(torch_version)
+    expected = bootstrap_attestation_payload(
+        torch_distribution_version=torch_distribution_version,
+        torch_version=torch_version,
+    )
     if not exact_json_equal(attestation, expected):
         raise SuiteError("torchrun bootstrap attestation is invalid")
     digest = _hash_regular_file(
@@ -1081,6 +1086,7 @@ def _read_bootstrap_attestation(
 def _run_elastic_scenario(
     root: Path,
     *,
+    torch_distribution_version: str,
     timeout_seconds: float,
     runner: ElasticRunner,
 ) -> tuple[dict[str, Any], str]:
@@ -1144,6 +1150,7 @@ def _run_elastic_scenario(
 
     bootstrap = _read_bootstrap_attestation(
         layout.root / BOOTSTRAP_ATTESTATION_NAME,
+        torch_distribution_version=torch_distribution_version,
         torch_version=torch_version,
     )
     marker, marker_sha256 = _read_failure_marker(failure_marker)
@@ -1201,14 +1208,30 @@ def _run_elastic_scenario(
     return observation, torch_version
 
 
-def _validate_runtime_versions(versions: set[str]) -> str:
+def _validate_runtime_versions(
+    versions: set[str],
+    *,
+    torch_distribution_version: str,
+) -> str:
     if len(versions) != 1:
         raise SuiteError("scenarios did not use one exact PyTorch runtime")
     torch_version = next(iter(versions))
-    installed = importlib.metadata.version("torch")
-    if torch_version not in {installed, f"{installed}+cpu"}:
-        raise SuiteError("worker PyTorch runtime differs from installed metadata")
+    if not is_registered_torch_version_pair(
+        torch_distribution_version,
+        torch_version,
+    ):
+        raise SuiteError("worker PyTorch distribution/runtime pair is not registered")
     return torch_version
+
+
+def _validated_torch_distribution_version() -> str:
+    try:
+        version = importlib.metadata.version("torch")
+    except importlib.metadata.PackageNotFoundError as error:
+        raise SuiteError("registered PyTorch distribution is unavailable") from error
+    if type(version) is not str or version not in {"2.11.0", "2.11.0+cpu"}:
+        raise SuiteError("PyTorch distribution is outside the registered versions")
+    return version
 
 
 def _validated_numpy_version() -> str:
@@ -1288,6 +1311,7 @@ def run_suite(
 
     observations: dict[str, dict[str, Any]] = {}
     torch_versions: set[str] = set()
+    torch_distribution_version = _validated_torch_distribution_version()
     native_root: Path | None = None
 
     with tempfile.TemporaryDirectory(prefix="dcp-invariant-") as temporary:
@@ -1317,6 +1341,7 @@ def run_suite(
 
         elastic_observation, elastic_torch_version = _run_elastic_scenario(
             native_root / "elastic_restart_2_to_2",
+            torch_distribution_version=torch_distribution_version,
             timeout_seconds=timeout_seconds,
             runner=elastic_runner,
         )
@@ -1361,7 +1386,10 @@ def run_suite(
 
         _validate_observation_registry(observations)
         _validate_all_state_contracts(observations)
-        torch_version = _validate_runtime_versions(torch_versions)
+        torch_version = _validate_runtime_versions(
+            torch_versions,
+            torch_distribution_version=torch_distribution_version,
+        )
         numpy_version = _validated_numpy_version()
 
     native_work_cleaned = (

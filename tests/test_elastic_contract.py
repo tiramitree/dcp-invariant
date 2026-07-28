@@ -7,9 +7,60 @@ from dcp_invariant.elastic_contract import (
     REGISTERED_MAX_RESTARTS,
     REGISTERED_WORLD_SIZE,
     ElasticContractError,
+    bootstrap_attestation_payload,
     failure_marker_payload,
+    is_registered_torch_version_pair,
     parse_elastic_environment,
 )
+
+
+@pytest.mark.parametrize(
+    ("torch_distribution_version", "torch_version"),
+    [
+        ("2.11.0", "2.11.0+cpu"),
+        ("2.11.0+cpu", "2.11.0+cpu"),
+    ],
+)
+def test_registered_torch_distribution_runtime_pairs_are_exact(
+    torch_distribution_version: str,
+    torch_version: str,
+) -> None:
+    assert is_registered_torch_version_pair(
+        torch_distribution_version,
+        torch_version,
+    )
+    payload = bootstrap_attestation_payload(
+        torch_distribution_version=torch_distribution_version,
+        torch_version=torch_version,
+    )
+    assert payload["torch_distribution_version"] == torch_distribution_version
+    assert payload["torch_version"] == torch_version
+
+
+@pytest.mark.parametrize(
+    ("torch_distribution_version", "torch_version"),
+    [
+        ("2.11.0", "2.11.0"),
+        ("2.11.0+cpu", "2.11.0"),
+        ("2.11.1+cpu", "2.11.1+cpu"),
+        ("2.11.0+cu128", "2.11.0+cu128"),
+        (None, "2.11.0+cpu"),
+        ("2.11.0", None),
+    ],
+)
+def test_unregistered_or_mismatched_torch_pairs_are_rejected(
+    torch_distribution_version: object,
+    torch_version: object,
+) -> None:
+    assert not is_registered_torch_version_pair(
+        torch_distribution_version,
+        torch_version,
+    )
+    with pytest.raises(ElasticContractError, match="pair"):
+        bootstrap_attestation_payload(
+            torch_distribution_version=torch_distribution_version,
+            torch_version=torch_version,
+        )
 
 
 def elastic_environment(*, rank: int = 0, restart_count: int = 0) -> dict[str, str]:

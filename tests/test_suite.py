@@ -15,12 +15,48 @@ from dcp_invariant.suite import (
     _run_rank_exit_fault,
     _validate_rank_consensus,
     _validate_report,
+    _validate_runtime_versions,
     _write_seed_pointer,
     run_suite,
 )
 from dcp_invariant.supervisor import LATEST_SCHEMA, WorkerResult
 
 SHA256 = "a" * 64
+
+
+@pytest.mark.parametrize(
+    "torch_distribution_version",
+    ["2.11.0", "2.11.0+cpu"],
+)
+def test_suite_accepts_only_registered_torch_pairs(
+    torch_distribution_version: str,
+) -> None:
+    assert (
+        _validate_runtime_versions(
+            {"2.11.0+cpu"},
+            torch_distribution_version=torch_distribution_version,
+        )
+        == "2.11.0+cpu"
+    )
+
+
+@pytest.mark.parametrize(
+    ("torch_distribution_version", "torch_version"),
+    [
+        ("2.11.0", "2.11.0"),
+        ("2.11.0+cpu", "2.11.0"),
+        ("2.11.1+cpu", "2.11.1+cpu"),
+    ],
+)
+def test_suite_rejects_inferred_or_unknown_torch_pairs(
+    torch_distribution_version: str,
+    torch_version: str,
+) -> None:
+    with pytest.raises(SuiteError, match="pair"):
+        _validate_runtime_versions(
+            {torch_version},
+            torch_distribution_version=torch_distribution_version,
+        )
 
 
 def training_save_report(rank: int, world_size: int) -> dict[str, object]:

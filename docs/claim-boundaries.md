@@ -17,8 +17,9 @@
   fixed and repeated by both final worker reports. Both reports recorded only
   the fixed `loopback_rendezvous:true` derivative after validating the actual
   worker environment as a numeric loopback IP. The private canonical bootstrap
-  attestation matched its normalized public fields and digest, and its torch
-  version equaled the provenance runtime version.
+  attestation matched its normalized public fields and digest, including one
+  of the two registered torch distribution/runtime pairs; its runtime version
+  equaled the provenance runtime version.
 - Rank one recorded the registered attempt-zero injected exit code 91 in the
   private marker; the final two reports both recorded restart count one and
   maximum restarts one. The launcher did not independently expose an
