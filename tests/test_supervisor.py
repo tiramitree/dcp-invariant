@@ -127,6 +127,21 @@ def test_successful_promotion_updates_pointer(tmp_path: Path) -> None:
     }
 
 
+def test_async_checkpoint_can_use_receipt_bound_promotion(tmp_path: Path) -> None:
+    root, candidate = promotion_root(tmp_path)
+    original = candidate / "checkpoint-one"
+    checkpoint = candidate / "checkpoint-async"
+    original.rename(checkpoint)
+
+    target = promote_candidate(
+        root=root,
+        candidate=candidate,
+        logical_checkpoint_id="checkpoint-async",
+        verify=lambda path: path.name == "checkpoint-async",
+    )
+    assert (target / "checkpoint-async" / "checkpoint-receipt.json").is_file()
+
+
 def test_failed_verification_preserves_old_pointer(tmp_path: Path) -> None:
     root, candidate = promotion_root(tmp_path)
     previous = (

@@ -24,12 +24,26 @@ Before promotion, the runner:
 5. renames the candidate wrapper into `committed/<receipt-sha256>` and verifies
    it again before atomically replacing `LATEST.json`.
 
-The loader verifies the committed checkpoint before and after DCP load. The
-elastic scenario publishes both normalized receipt digests and requires exact
-equality, while the generation pointer is read before launch and after the
-successful restarted load and must remain byte-identical. A concurrent change
-therefore cannot produce passing evidence, although this is not a defense
-against an adversary capable of perfectly racing and restoring bytes.
+The training, DTensor, and elastic positive loaders verify the committed
+checkpoint before and after DCP load. The elastic scenario publishes both
+normalized receipt digests and requires exact equality, while the generation
+pointer is read before launch and after the successful restarted load and must
+remain byte-identical. A concurrent change therefore cannot produce passing
+evidence, although this is not a defense against an adversary capable of
+perfectly racing and restoring bytes.
+
+The asynchronous scenario calls the public `FileSystemWriter.stage` hook,
+records staged state digests, and then blocks the public
+`StorageWriter.write_data` hook before it delegates to native I/O. Both ranks
+must record stage completion and gate entry exactly once, and the future must
+still be pending, before the main thread applies the one registered model-only
+mutation. The main thread makes no explicit process-group collective call while
+writing is blocked. A `finally` path releases the gate and joins the future so
+a local validation failure does not intentionally strand the writer thread.
+This is a deterministic test gate around public APIs, not a claim about
+scheduling or durability in an arbitrary application. Its native candidate is
+sealed, loaded, and verified again after load before the suite performs
+receipt-bound promotion and verifies the committed generation.
 
 On POSIX, this project fsyncs the receipt and pointer files it writes and their
 affected directories. It does not control how PyTorch persists native shard or
@@ -92,14 +106,19 @@ Windows process-tree containment or detached-descendant cleanup.
 
 ## Public artifact
 
-Native checkpoints, the raw elastic marker, the raw bootstrap attestation,
-torchrun temporary data, and machine-specific launch details live only under
-an automatically removed temporary root. The normalized public artifact is created only after removal is
-confirmed.
+Native checkpoints, standalone asynchronous gate-marker and rank-report files,
+the raw elastic marker, the raw bootstrap attestation, torchrun temporary data,
+and machine-specific launch details live only under an automatically removed
+temporary root. The normalized public artifact is created only after removal
+is confirmed. The asynchronous public observation embeds only the validated
+fixed rank-report fields, registered runtime versions, fixed booleans, state
+digests, workload declaration, and receipt/promotion evidence; it contains no
+raw tensor, timing, checkpoint byte size, path, host, process, port,
+environment, or log.
 
-The manifest is an unsigned integrity closure, not authentication. The v2
-verifier intentionally rejects the v1 fixed inventory; use the v0.1 verifier
-for v1 artifacts.
+The manifest is an unsigned integrity closure, not authentication. The v3
+verifier intentionally rejects the v2 and v1 fixed inventories; use their
+matching v0.2 or v0.1 verifier for historical artifacts.
 
 The negative-control scenarios seed a canonical pointer record and require its
 bytes to remain unchanged. They do not claim that this sentinel points to an

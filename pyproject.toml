@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "dcp-invariant"
-version = "0.2.0"
-description = "Fixture-scoped restart-invariant evidence for PyTorch Distributed Checkpoint."
+version = "0.3.0"
+description = "Fixture-scoped state and snapshot evidence for PyTorch Distributed Checkpoint."
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
 license = "Apache-2.0"
@@ -30,6 +30,7 @@ dev = [
 ]
 runtime = [
   "numpy==2.4.6",
+  "Pillow==12.3.0",
 ]
 
 [project.scripts]

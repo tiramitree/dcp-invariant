@@ -19,7 +19,7 @@ from .checkpoint_receipt import RECEIPT_NAME
 
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 LATEST_SCHEMA = "dcp-invariant-latest-v1"
-REGISTERED_CHECKPOINT_IDS = {"checkpoint-one", "checkpoint-two"}
+REGISTERED_CHECKPOINT_IDS = {"checkpoint-async", "checkpoint-one", "checkpoint-two"}
 
 
 class SupervisorError(RuntimeError):

@@ -150,7 +150,11 @@ def build_receipt(
     torch_version: str,
     state_contract_sha256: str,
 ) -> dict[str, Any]:
-    if logical_checkpoint_id not in {"checkpoint-one", "checkpoint-two"}:
+    if logical_checkpoint_id not in {
+        "checkpoint-async",
+        "checkpoint-one",
+        "checkpoint-two",
+    }:
         raise CheckpointReceiptError("unregistered logical checkpoint identifier")
     if not re.fullmatch(r"2\.11\.0(?:\+cpu)?", torch_version):
         raise CheckpointReceiptError("unregistered PyTorch version")
@@ -248,6 +252,7 @@ def _validate_receipt_shape(receipt: object) -> dict[str, Any]:
     if receipt["receipt_schema"] != RECEIPT_SCHEMA:
         raise CheckpointReceiptError("receipt schema is invalid")
     if receipt["logical_checkpoint_id"] not in {
+        "checkpoint-async",
         "checkpoint-one",
         "checkpoint-two",
     }:

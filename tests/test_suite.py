@@ -7,12 +7,19 @@ from pathlib import Path
 import pytest
 
 from dcp_invariant.artifact import normalize_observation
+from dcp_invariant.async_snapshot_contract import (
+    ASYNC_SNAPSHOT_ACTION,
+    ASYNC_SNAPSHOT_REPORT_SCHEMA,
+    workload_contract_digest,
+)
 from dcp_invariant.canonical import canonical_json
 from dcp_invariant.suite import (
     SuiteError,
     _ensure_ordinary_output_parent,
+    _read_async_reports,
     _read_reports,
     _run_rank_exit_fault,
+    _validate_async_report,
     _validate_rank_consensus,
     _validate_report,
     _validate_runtime_versions,
@@ -86,6 +93,54 @@ def write_report(path: Path, report: dict[str, object]) -> None:
     )
 
 
+def async_report(rank: int) -> dict[str, object]:
+    pre_cursor = hashlib.sha256(b"pre-cursor").hexdigest()
+    pre_model = hashlib.sha256(b"pre-model").hexdigest()
+    pre_optimizer = hashlib.sha256(b"pre-optimizer").hexdigest()
+    pre_state = hashlib.sha256(b"pre-state").hexdigest()
+    return {
+        "action": ASYNC_SNAPSHOT_ACTION,
+        "async_checkpointer": "thread",
+        "direct_loaded_model_sha256": pre_model,
+        "future_pending_at_mutation": True,
+        "loaded_cursor_sha256": pre_cursor,
+        "loaded_equals_post": False,
+        "loaded_equals_pre": True,
+        "loaded_model_sha256": pre_model,
+        "loaded_optimizer_sha256": pre_optimizer,
+        "loaded_state_sha256": pre_state,
+        "load_target_before_model_sha256": hashlib.sha256(b"load-target").hexdigest(),
+        "pillow_version": "12.3.0",
+        "post_cursor_sha256": pre_cursor,
+        "post_differs_from_pre": True,
+        "post_model_sha256": hashlib.sha256(b"post-model").hexdigest(),
+        "post_optimizer_sha256": pre_optimizer,
+        "post_state_sha256": hashlib.sha256(b"post-state").hexdigest(),
+        "pre_cursor_sha256": pre_cursor,
+        "pre_model_sha256": pre_model,
+        "pre_optimizer_sha256": pre_optimizer,
+        "pre_state_sha256": pre_state,
+        "rank": rank,
+        "receipt_sha256": hashlib.sha256(b"receipt").hexdigest(),
+        "receipt_verified_after_load": True,
+        "receipt_verified_after_save": True,
+        "report_schema": ASYNC_SNAPSHOT_REPORT_SCHEMA,
+        "stage_call_count": 1,
+        "stage_completed_before_mutation": True,
+        "staged_model_sha256": pre_model,
+        "staged_optimizer_sha256": pre_optimizer,
+        "staged_state_sha256": pre_state,
+        "torch_version": "2.11.0+cpu",
+        "torchvision_distribution_version": "0.26.0+cpu",
+        "torchvision_runtime_version": "0.26.0+cpu",
+        "weights_downloaded": False,
+        "workload_contract_sha256": workload_contract_digest(),
+        "world_size": 2,
+        "writer_gate_entered": True,
+        "writer_gate_released": True,
+    }
+
+
 def test_training_report_requires_exact_fields_and_receipt_gate() -> None:
     report = training_save_report(0, 1)
     _validate_report(
@@ -103,6 +158,34 @@ def test_training_report_requires_exact_fields_and_receipt_gate() -> None:
             rank=0,
             world_size=1,
         )
+
+
+def test_async_report_requires_stage_pending_gate_and_exact_relations() -> None:
+    report = async_report(0)
+    _validate_async_report(report, rank=0)
+
+    report["future_pending_at_mutation"] = False
+    with pytest.raises(SuiteError, match="pending"):
+        _validate_async_report(report, rank=0)
+
+
+def test_async_report_reader_requires_complete_consensus(tmp_path: Path) -> None:
+    reports = tmp_path / "async-reports"
+    reports.mkdir()
+    write_report(reports / "rank-0.json", async_report(0))
+    with pytest.raises(SuiteError, match="rank set"):
+        _read_async_reports(reports)
+
+    write_report(reports / "rank-1.json", async_report(1))
+    parsed = _read_async_reports(reports)
+    assert [report["rank"] for report in parsed] == [0, 1]
+
+    (reports / "rank-1.json").unlink()
+    changed = async_report(1)
+    changed["post_model_sha256"] = hashlib.sha256(b"other-post").hexdigest()
+    write_report(reports / "rank-1.json", changed)
+    with pytest.raises(SuiteError, match="one normalized state"):
+        _read_async_reports(reports)
 
 
 def test_rank_consensus_ignores_only_rank() -> None:
@@ -225,8 +308,8 @@ def test_live_registered_suite_has_no_native_public_files(tmp_path: Path) -> Non
     )
 
     assert result.native_work_cleaned is True
-    assert result.artifact.summary["passed_scenarios"] == 11
-    assert len(result.observations) == 11
+    assert result.artifact.summary["passed_scenarios"] == 12
+    assert len(result.observations) == 12
     assert not [
         path
         for path in output.rglob("*")

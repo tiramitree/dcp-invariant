@@ -29,6 +29,19 @@ from .artifact import (
     normalize_observation,
     verify_evidence_artifact,
 )
+from .async_snapshot_contract import (
+    ASYNC_CHECKPOINT_ID,
+    ASYNC_GATE_DIRECTORY_NAME,
+    ASYNC_REPORT_DIRECTORY_NAME,
+    ASYNC_SNAPSHOT_ACTION,
+    ASYNC_SNAPSHOT_OBSERVATION_SCHEMA,
+    ASYNC_SNAPSHOT_REPORT_SCHEMA,
+    ASYNC_SNAPSHOT_SCENARIO,
+    ASYNC_WORLD_SIZE,
+    is_registered_torchvision_version_pair,
+    workload_contract,
+    workload_contract_digest,
+)
 from .canonical import canonical_json, exact_json_equal, strict_json_loads
 from .checkpoint_receipt import (
     RECEIPT_NAME,
@@ -62,6 +75,7 @@ _REPORT_MAX_BYTES = 64 * 1024
 _POINTER_MAX_BYTES = 1024
 _CHECKPOINT_ONE = "checkpoint-one"
 _CHECKPOINT_TWO = "checkpoint-two"
+_ASYNC_SNAPSHOT_MODULE = "dcp_invariant.async_snapshot_worker"
 _WORKER_MODULE = "dcp_invariant.worker"
 _RANK_EXIT_MODULE = "dcp_invariant.rank_exit_worker"
 _STATE_COMPONENTS = ("cursor", "model", "optimizer", "rng", "state")
@@ -366,6 +380,138 @@ def _read_reports(
         )
         reports.append(report)
     _validate_rank_consensus(reports)
+    return reports
+
+
+_ASYNC_REPORT_FIELDS = frozenset(
+    {
+        "action",
+        "async_checkpointer",
+        "direct_loaded_model_sha256",
+        "future_pending_at_mutation",
+        "loaded_cursor_sha256",
+        "loaded_equals_post",
+        "loaded_equals_pre",
+        "loaded_model_sha256",
+        "loaded_optimizer_sha256",
+        "loaded_state_sha256",
+        "load_target_before_model_sha256",
+        "pillow_version",
+        "post_cursor_sha256",
+        "post_differs_from_pre",
+        "post_model_sha256",
+        "post_optimizer_sha256",
+        "post_state_sha256",
+        "pre_cursor_sha256",
+        "pre_model_sha256",
+        "pre_optimizer_sha256",
+        "pre_state_sha256",
+        "rank",
+        "receipt_sha256",
+        "receipt_verified_after_load",
+        "receipt_verified_after_save",
+        "report_schema",
+        "stage_call_count",
+        "stage_completed_before_mutation",
+        "staged_model_sha256",
+        "staged_optimizer_sha256",
+        "staged_state_sha256",
+        "torch_version",
+        "torchvision_distribution_version",
+        "torchvision_runtime_version",
+        "weights_downloaded",
+        "workload_contract_sha256",
+        "world_size",
+        "writer_gate_entered",
+        "writer_gate_released",
+    }
+)
+
+
+def _validate_async_report(value: dict[str, Any], *, rank: int) -> None:
+    if set(value) != set(_ASYNC_REPORT_FIELDS):
+        raise SuiteError("async report field set is invalid")
+    _require_exact(value["action"], ASYNC_SNAPSHOT_ACTION, "async action")
+    _require_exact(value["async_checkpointer"], "thread", "async checkpointer")
+    _require_exact_int(value["rank"], rank, "async rank")
+    _require_exact_int(value["world_size"], ASYNC_WORLD_SIZE, "async world size")
+    _require_exact(
+        value["report_schema"],
+        ASYNC_SNAPSHOT_REPORT_SCHEMA,
+        "async report schema",
+    )
+    for field in _ASYNC_REPORT_FIELDS:
+        if field.endswith("_sha256"):
+            _require_sha256(value[field], field)
+    for field in (
+        "future_pending_at_mutation",
+        "loaded_equals_pre",
+        "post_differs_from_pre",
+        "receipt_verified_after_load",
+        "receipt_verified_after_save",
+        "stage_completed_before_mutation",
+        "writer_gate_entered",
+        "writer_gate_released",
+    ):
+        _require_exact(value[field], True, field)
+    _require_exact(value["loaded_equals_post"], False, "loaded post inequality")
+    _require_exact(value["stage_call_count"], 1, "async stage call count")
+    _require_exact(value["weights_downloaded"], False, "weight download boundary")
+    _require_exact(value["pillow_version"], "12.3.0", "Pillow version")
+    if type(value["torch_version"]) is not str or not re.fullmatch(
+        r"2\.11\.0(?:\+cpu)?", value["torch_version"]
+    ):
+        raise SuiteError("async PyTorch version is invalid")
+    if not is_registered_torchvision_version_pair(
+        value["torchvision_distribution_version"],
+        value["torchvision_runtime_version"],
+    ):
+        raise SuiteError("async torchvision pair is invalid")
+    if value["workload_contract_sha256"] != workload_contract_digest():
+        raise SuiteError("async workload contract differs")
+    if (
+        value["staged_model_sha256"] != value["pre_model_sha256"]
+        or value["staged_optimizer_sha256"] != value["pre_optimizer_sha256"]
+        or value["staged_state_sha256"] != value["pre_state_sha256"]
+        or value["loaded_cursor_sha256"] != value["pre_cursor_sha256"]
+        or value["loaded_model_sha256"] != value["pre_model_sha256"]
+        or value["loaded_optimizer_sha256"] != value["pre_optimizer_sha256"]
+        or value["loaded_state_sha256"] != value["pre_state_sha256"]
+        or value["direct_loaded_model_sha256"] != value["pre_model_sha256"]
+        or value["load_target_before_model_sha256"] == value["pre_model_sha256"]
+        or value["post_cursor_sha256"] != value["pre_cursor_sha256"]
+        or value["post_optimizer_sha256"] != value["pre_optimizer_sha256"]
+        or value["post_model_sha256"] == value["pre_model_sha256"]
+        or value["post_state_sha256"] == value["pre_state_sha256"]
+    ):
+        raise SuiteError("async state relation is invalid")
+
+
+def _read_async_reports(root: Path) -> list[dict[str, Any]]:
+    _ordinary_directory(root, "async report directory")
+    try:
+        entries = {entry.name: entry for entry in root.iterdir()}
+    except OSError as error:
+        raise SuiteError("async report directory cannot be enumerated") from error
+    expected_names = {f"rank-{rank}.json" for rank in range(ASYNC_WORLD_SIZE)}
+    if set(entries) != expected_names:
+        raise SuiteError("async report rank set is incomplete or contains extras")
+    reports: list[dict[str, Any]] = []
+    for rank in range(ASYNC_WORLD_SIZE):
+        report = _read_canonical_object(
+            entries[f"rank-{rank}.json"],
+            _REPORT_MAX_BYTES,
+            "async worker report",
+        )
+        _validate_async_report(report, rank=rank)
+        reports.append(report)
+    reference = dict(reports[0])
+    reference.pop("rank")
+    for report in reports[1:]:
+        candidate = dict(report)
+        candidate.pop("rank")
+        if not exact_json_equal(candidate, reference):
+            raise SuiteError("async ranks do not report one normalized state")
     return reports
 
 
@@ -1208,6 +1354,112 @@ def _run_elastic_scenario(
     return observation, torch_version
 
 
+def _run_async_snapshot_scenario(
+    root: Path,
+    *,
+    timeout_seconds: float,
+) -> tuple[dict[str, Any], str, str, str]:
+    try:
+        root.mkdir()
+        candidates = root / "candidates"
+        committed = root / "committed"
+        gate = root / ASYNC_GATE_DIRECTORY_NAME
+        reports_root = root / ASYNC_REPORT_DIRECTORY_NAME
+        worker_home = root / "worker-home"
+        candidates.mkdir()
+        committed.mkdir()
+        gate.mkdir()
+        reports_root.mkdir()
+        worker_home.mkdir()
+        candidate = candidates / "candidate"
+        candidate.mkdir()
+    except OSError as error:
+        raise SuiteError("cannot create async scenario layout") from error
+
+    worker_result = run_workers(
+        module=_ASYNC_SNAPSHOT_MODULE,
+        common_arguments=[
+            "--checkpoint-id",
+            ASYNC_CHECKPOINT_ID,
+            "--gate-dir",
+            str(gate),
+            "--report-dir",
+            str(reports_root),
+        ],
+        world_size=ASYNC_WORLD_SIZE,
+        cwd=candidate,
+        isolated_home=worker_home,
+        timeout_seconds=timeout_seconds,
+    )
+    reports = _read_async_reports(reports_root)
+    torch_version = reports[0]["torch_version"]
+    torchvision_distribution_version = reports[0]["torchvision_distribution_version"]
+    torchvision_runtime_version = reports[0]["torchvision_runtime_version"]
+    checkpoint = candidate / ASYNC_CHECKPOINT_ID
+    receipt, receipt_sha256 = _verified_receipt(
+        checkpoint,
+        checkpoint_id=ASYNC_CHECKPOINT_ID,
+        expected_state_contract=workload_contract_digest(),
+        expected_torch_version=torch_version,
+    )
+    if (
+        reports[0]["receipt_sha256"] != receipt_sha256
+        or receipt["state_contract_sha256"] != workload_contract_digest()
+    ):
+        raise SuiteError("async receipt differs from worker evidence")
+
+    committed_generation = promote_candidate(
+        root=root,
+        candidate=candidate,
+        logical_checkpoint_id=ASYNC_CHECKPOINT_ID,
+        verify=_promotion_verifier(
+            checkpoint_id=ASYNC_CHECKPOINT_ID,
+            state_contract_sha256=workload_contract_digest(),
+            torch_version=torch_version,
+            receipt_sha256=receipt_sha256,
+        ),
+    )
+    committed_checkpoint = committed_generation / ASYNC_CHECKPOINT_ID
+    _, committed_receipt_sha256 = _verified_receipt(
+        committed_checkpoint,
+        checkpoint_id=ASYNC_CHECKPOINT_ID,
+        expected_state_contract=workload_contract_digest(),
+        expected_torch_version=torch_version,
+    )
+    if committed_receipt_sha256 != receipt_sha256:
+        raise SuiteError("async receipt changed during promotion")
+    pointer = _read_normalized_pointer(root)
+    if pointer["generation"] != receipt_sha256:
+        raise SuiteError("async promotion pointer differs from receipt")
+
+    observation = {
+        "checkpoint_id": ASYNC_CHECKPOINT_ID,
+        "observation_schema": ASYNC_SNAPSHOT_OBSERVATION_SCHEMA,
+        "promotion_pointer": pointer,
+        "rank_reports": reports,
+        "receipt_sha256": receipt_sha256,
+        "receipt_verified_after_load": True,
+        "receipt_verified_after_promotion": True,
+        "scenario": ASYNC_SNAPSHOT_SCENARIO,
+        "source_world_size": ASYNC_WORLD_SIZE,
+        "target_world_size": ASYNC_WORLD_SIZE,
+        "worker": _worker_observation(worker_result),
+        "workload": workload_contract(),
+    }
+    try:
+        normalized, _ = normalize_observation(observation)
+    except (TypeError, ValueError) as error:
+        raise SuiteError("async observation failed normalization") from error
+    if not exact_json_equal(normalized, observation):
+        raise SuiteError("async observation changed during normalization")
+    return (
+        observation,
+        torch_version,
+        torchvision_distribution_version,
+        torchvision_runtime_version,
+    )
+
+
 def _validate_runtime_versions(
     versions: set[str],
     *,
@@ -1231,6 +1483,31 @@ def _validated_torch_distribution_version() -> str:
         raise SuiteError("registered PyTorch distribution is unavailable") from error
     if type(version) is not str or version not in {"2.11.0", "2.11.0+cpu"}:
         raise SuiteError("PyTorch distribution is outside the registered versions")
+    return version
+
+
+def _validated_torchvision_distribution_version() -> str:
+    try:
+        version = importlib.metadata.version("torchvision")
+    except importlib.metadata.PackageNotFoundError as error:
+        raise SuiteError(
+            "registered torchvision distribution is unavailable"
+        ) from error
+    if version not in {"0.26.0", "0.26.0+cpu"}:
+        raise SuiteError("torchvision distribution is outside the registered version")
+    return version
+
+
+def _validated_pillow_version() -> str:
+    try:
+        version = importlib.metadata.version("Pillow")
+        import PIL
+    except (ImportError, importlib.metadata.PackageNotFoundError) as error:
+        raise SuiteError("registered Pillow runtime is unavailable") from error
+    if version != "12.3.0" or str(PIL.__version__) != version:
+        raise SuiteError(
+            "Pillow distribution/runtime pair is outside the registered version"
+        )
     return version
 
 
@@ -1287,7 +1564,7 @@ def run_suite(
     rank_exit_runner: RankExitRunner | None = None,
     elastic_runner: ElasticRunner | None = None,
 ) -> SuiteRun:
-    """Run all eleven registered scenarios and create one offline artifact.
+    """Run all twelve registered scenarios and create one offline artifact.
 
     ``output_root`` must start absent.  No public file is created until the
     temporary native-checkpoint tree has been removed successfully.
@@ -1313,10 +1590,32 @@ def run_suite(
     torch_versions: set[str] = set()
     torch_distribution_version = _validated_torch_distribution_version()
     native_root: Path | None = None
+    torchvision_distribution_version = _validated_torchvision_distribution_version()
+    _validated_pillow_version()
 
     with tempfile.TemporaryDirectory(prefix="dcp-invariant-") as temporary:
         native_root = Path(temporary)
         _ordinary_directory(native_root, "native temporary root")
+
+        (
+            async_observation,
+            async_torch_version,
+            async_torchvision_distribution_version,
+            async_torchvision_runtime_version,
+        ) = _run_async_snapshot_scenario(
+            native_root / ASYNC_SNAPSHOT_SCENARIO,
+            timeout_seconds=timeout_seconds,
+        )
+        if (
+            async_torchvision_distribution_version != torchvision_distribution_version
+            or not is_registered_torchvision_version_pair(
+                async_torchvision_distribution_version,
+                async_torchvision_runtime_version,
+            )
+        ):
+            raise SuiteError("async torchvision runtime changed across launch")
+        observations[ASYNC_SNAPSHOT_SCENARIO] = async_observation
+        torch_versions.add(async_torch_version)
 
         for source_world_size, target_world_size in (
             (1, 1),

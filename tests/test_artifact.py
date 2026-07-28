@@ -21,6 +21,15 @@ from dcp_invariant.artifact import (
     normalize_observation,
     verify_evidence_artifact,
 )
+from dcp_invariant.async_snapshot_contract import (
+    ASYNC_CHECKPOINT_ID,
+    ASYNC_SNAPSHOT_ACTION,
+    ASYNC_SNAPSHOT_OBSERVATION_SCHEMA,
+    ASYNC_SNAPSHOT_REPORT_SCHEMA,
+    ASYNC_SNAPSHOT_SCENARIO,
+    workload_contract,
+    workload_contract_digest,
+)
 from dcp_invariant.canonical import canonical_json
 from dcp_invariant.elastic_contract import (
     BOOTSTRAP_ID,
@@ -92,6 +101,81 @@ def training_reports(
 
 def worker_outcome(world_size: int) -> dict[str, object]:
     return {"exit_codes": [0] * world_size, "timed_out": False}
+
+
+def async_observation() -> dict[str, object]:
+    receipt = digest("async-receipt")
+    pre = {
+        "cursor": digest("async-pre-cursor"),
+        "model": digest("async-pre-model"),
+        "optimizer": digest("async-pre-optimizer"),
+        "state": digest("async-pre-state"),
+    }
+    post = {
+        "cursor": pre["cursor"],
+        "model": digest("async-post-model"),
+        "optimizer": pre["optimizer"],
+        "state": digest("async-post-state"),
+    }
+    reports = []
+    for rank in range(2):
+        reports.append(
+            {
+                "action": ASYNC_SNAPSHOT_ACTION,
+                "async_checkpointer": "thread",
+                "direct_loaded_model_sha256": pre["model"],
+                "future_pending_at_mutation": True,
+                "loaded_cursor_sha256": pre["cursor"],
+                "loaded_equals_post": False,
+                "loaded_equals_pre": True,
+                "loaded_model_sha256": pre["model"],
+                "loaded_optimizer_sha256": pre["optimizer"],
+                "loaded_state_sha256": pre["state"],
+                "load_target_before_model_sha256": digest("async-load-target"),
+                "pillow_version": "12.3.0",
+                "post_cursor_sha256": post["cursor"],
+                "post_differs_from_pre": True,
+                "post_model_sha256": post["model"],
+                "post_optimizer_sha256": post["optimizer"],
+                "post_state_sha256": post["state"],
+                "pre_cursor_sha256": pre["cursor"],
+                "pre_model_sha256": pre["model"],
+                "pre_optimizer_sha256": pre["optimizer"],
+                "pre_state_sha256": pre["state"],
+                "rank": rank,
+                "receipt_sha256": receipt,
+                "receipt_verified_after_load": True,
+                "receipt_verified_after_save": True,
+                "report_schema": ASYNC_SNAPSHOT_REPORT_SCHEMA,
+                "stage_call_count": 1,
+                "stage_completed_before_mutation": True,
+                "staged_model_sha256": pre["model"],
+                "staged_optimizer_sha256": pre["optimizer"],
+                "staged_state_sha256": pre["state"],
+                "torch_version": TORCH_VERSION,
+                "torchvision_distribution_version": "0.26.0+cpu",
+                "torchvision_runtime_version": "0.26.0+cpu",
+                "weights_downloaded": False,
+                "workload_contract_sha256": workload_contract_digest(),
+                "world_size": 2,
+                "writer_gate_entered": True,
+                "writer_gate_released": True,
+            }
+        )
+    return {
+        "checkpoint_id": ASYNC_CHECKPOINT_ID,
+        "observation_schema": ASYNC_SNAPSHOT_OBSERVATION_SCHEMA,
+        "promotion_pointer": pointer(receipt),
+        "rank_reports": reports,
+        "receipt_sha256": receipt,
+        "receipt_verified_after_load": True,
+        "receipt_verified_after_promotion": True,
+        "scenario": ASYNC_SNAPSHOT_SCENARIO,
+        "source_world_size": 2,
+        "target_world_size": 2,
+        "worker": worker_outcome(2),
+        "workload": workload_contract(),
+    }
 
 
 def positive_common(
@@ -317,6 +401,7 @@ def receipt_fault_observation(scenario: str) -> dict[str, object]:
 def complete_observations() -> dict[str, dict[str, object]]:
     return {
         "dtensor_1_to_2": dtensor_observation("dtensor_1_to_2", 1, 2),
+        ASYNC_SNAPSHOT_SCENARIO: async_observation(),
         "dtensor_2_to_1": dtensor_observation("dtensor_2_to_1", 2, 1),
         "training_1_to_1": training_observation("training_1_to_1", 1, 1),
         "training_1_to_2": training_observation("training_1_to_2", 1, 2),
@@ -383,13 +468,14 @@ def test_round_trip_binds_observations_results_and_fixed_inventory(
     verified = verify_evidence_artifact(root)
     assert created == verified
     assert set(verified.observations) == set(REGISTERED_SCENARIOS)
+    assert verified.summary["async_snapshot_equalities"] == 1
     assert set(verified.results) == set(REGISTERED_SCENARIOS)
-    assert verified.summary["passed_scenarios"] == 11
+    assert verified.summary["passed_scenarios"] == 12
     assert verified.summary["state_equalities"] == 4
     assert verified.summary["elastic_recoveries"] == 1
     assert verified.summary["global_tensor_equalities"] == 2
     assert verified.summary["fault_rejections"] == 4
-    assert verified.summary["promotion_allowed_scenarios"] == 7
+    assert verified.summary["promotion_allowed_scenarios"] == 8
     assert set(path.name for path in root.iterdir()) == {
         "junit.xml",
         MANIFEST_NAME,
@@ -429,6 +515,68 @@ def test_results_are_derived_from_observations_not_caller_hashes(
             ]
         )
     )
+
+
+def test_async_result_is_derived_from_staged_loaded_and_mutated_states(
+    tmp_path: Path,
+) -> None:
+    verified = build(tmp_path / "evidence")
+    result = verified.results[ASYNC_SNAPSHOT_SCENARIO]
+
+    assert result["staged_state_sha256"] == result["pre_snapshot_state_sha256"]
+    assert result["loaded_state_sha256"] == result["pre_snapshot_state_sha256"]
+    assert result["post_mutation_state_sha256"] != result["pre_snapshot_state_sha256"]
+    assert result["promotion_allowed"] is True
+    assert result["workload_contract_sha256"] == workload_contract_digest()
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement", "message"),
+    [
+        ("future_pending_at_mutation", False, "pending future"),
+        ("stage_call_count", 0, "stage call"),
+        ("staged_model_sha256", "b" * 64, "staged state"),
+        ("loaded_model_sha256", "b" * 64, "loaded state"),
+        ("post_optimizer_sha256", "b" * 64, "targeted mutation"),
+        ("pillow_version", "12.2.0", "Pillow"),
+        (
+            "torchvision_runtime_version",
+            "0.26.1+cpu",
+            "torchvision",
+        ),
+        ("workload_contract_sha256", "b" * 64, "workload contract"),
+    ],
+)
+def test_async_observation_rejects_false_gate_runtime_or_state_evidence(
+    field: str,
+    replacement: object,
+    message: str,
+) -> None:
+    observation = async_observation()
+    for report in observation["rank_reports"]:
+        report[field] = replacement
+    with pytest.raises(EvidenceArtifactError, match=message):
+        normalize_observation(observation)
+
+
+def test_async_observation_requires_targeted_model_mutation() -> None:
+    observation = async_observation()
+    for report in observation["rank_reports"]:
+        report["post_model_sha256"] = report["pre_model_sha256"]
+    with pytest.raises(EvidenceArtifactError, match="targeted mutation"):
+        normalize_observation(observation)
+
+
+def test_async_observation_rejects_rank_disagreement_and_extra_timing() -> None:
+    observation = async_observation()
+    observation["rank_reports"][1]["post_state_sha256"] = digest("other-post-state")
+    with pytest.raises(EvidenceArtifactError, match="disagree"):
+        normalize_observation(observation)
+
+    observation = async_observation()
+    observation["rank_reports"][0]["staging_elapsed_ns"] = 1
+    with pytest.raises(EvidenceArtifactError, match="field set"):
+        normalize_observation(observation)
 
 
 def test_dtensor_result_names_global_tensor_not_shards(tmp_path: Path) -> None:

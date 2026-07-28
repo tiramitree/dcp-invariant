@@ -17,7 +17,7 @@ def fake_artifact() -> SimpleNamespace:
         manifest_sha256="a" * 64,
         summary={
             "overall_status": "pass",
-            "passed_scenarios": 11,
+            "passed_scenarios": 12,
         },
     )
 
@@ -36,7 +36,7 @@ def test_verify_prints_only_normalized_success(
     assert capsys.readouterr().out == (
         '{"manifest_sha256":"'
         + ("a" * 64)
-        + '","overall_status":"pass","passed_scenarios":11}\n'
+        + '","overall_status":"pass","passed_scenarios":12}\n'
     )
 
 
@@ -61,7 +61,7 @@ def test_run_imports_suite_lazily(
         )
         == 0
     )
-    assert '"passed_scenarios":11' in capsys.readouterr().out
+    assert '"passed_scenarios":12' in capsys.readouterr().out
 
 
 def test_failure_output_does_not_echo_sensitive_exception(
@@ -108,7 +108,7 @@ try:
     main(["verify", "--artifact-dir", sys.argv[1]])
 except SystemExit:
     pass
-raise SystemExit(1 if "torch" in sys.modules else 0)
+raise SystemExit(1 if {"torch", "torchvision", "PIL"} & set(sys.modules) else 0)
 """
     result = subprocess.run(
         [sys.executable, "-c", script, str(tmp_path)],

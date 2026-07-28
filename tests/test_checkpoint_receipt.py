@@ -44,6 +44,18 @@ def test_receipt_round_trip(tmp_path: Path) -> None:
     assert verify_checkpoint(checkpoint) == expected
 
 
+def test_async_checkpoint_identifier_is_receipt_bound(tmp_path: Path) -> None:
+    checkpoint = native_checkpoint(tmp_path)
+    receipt = build_receipt(
+        checkpoint,
+        logical_checkpoint_id="checkpoint-async",
+        torch_version="2.11.0+cpu",
+        state_contract_sha256=CONTRACT,
+    )
+    write_receipt(checkpoint, receipt)
+    assert verify_checkpoint(checkpoint)["logical_checkpoint_id"] == "checkpoint-async"
+
+
 def test_changed_shard_is_rejected_before_load(tmp_path: Path) -> None:
     checkpoint = native_checkpoint(tmp_path)
     seal(checkpoint)

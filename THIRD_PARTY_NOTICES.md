@@ -11,12 +11,27 @@ Checkpoint. PyTorch is distributed under the BSD-3-Clause license:
 - Release: https://github.com/pytorch/pytorch/releases/tag/v2.11.0
 - License: https://github.com/pytorch/pytorch/blob/v2.11.0/LICENSE
 
+The asynchronous integration scenario also executes torchvision 0.26.0 to
+construct ResNet18 with `weights=None`. torchvision is distributed under the
+BSD-3-Clause license:
+
+- Project: https://github.com/pytorch/vision
+- Release: https://github.com/pytorch/vision/releases/tag/v0.26.0
+- License: https://github.com/pytorch/vision/blob/v0.26.0/LICENSE
+
 The exact integration lane also executes NumPy 2.4.6. NumPy is distributed
 under its published multi-license expression:
 
 - Project: https://numpy.org/
 - Release: https://pypi.org/project/numpy/2.4.6/
 - License files: https://github.com/numpy/numpy/tree/v2.4.6/LICENSES
+
+The asynchronous integration scenario executes Pillow 12.3.0, distributed
+under the MIT-CMU license:
+
+- Project: https://python-pillow.github.io/
+- Release: https://pypi.org/project/Pillow/12.3.0/
+- License: https://github.com/python-pillow/Pillow/blob/12.3.0/LICENSE
 
 Dependency installation does not change the license of DCPInvariant's original
 Apache-2.0 code.

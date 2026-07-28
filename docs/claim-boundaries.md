@@ -1,8 +1,8 @@
 # Claim boundaries
 
-## Supported by a passing v2 artifact
+## Supported by a passing v3 artifact
 
-- PyTorch 2.11.0 CPU/Gloo executed the fixed single-host fixture.
+- PyTorch 2.11.0 CPU/Gloo executed the fixed single-host fixtures.
 - DDP training state was saved at one or two processes and loaded at one or
   two processes.
 - Model, SGD momentum, explicit CPU generator, and data cursor matched at the
@@ -30,13 +30,32 @@
 - No post-failure promotion was attempted in the elastic scenario.
 - The reconstructed DTensor global tensor matched after 1-to-2 and 2-to-1
   resharding.
+- The fixed two-rank asynchronous workload constructed
+  `torchvision.models.resnet18(weights=None)` with the registered torchvision
+  0.26.0 and Pillow 12.3.0 runtime, synthetic input, and no weight download.
+- Both asynchronous ranks completed the public `FileSystemWriter.stage` hook
+  exactly once, entered the public `StorageWriter.write_data` gate, and
+  observed the asynchronous future still pending before the registered
+  mutation.
+- Staged model, optimizer, and aggregate-state digests equaled the
+  pre-mutation digests. The main thread then changed only
+  `model.conv1.weight` by the fixed registered scalar while leaving the
+  application cursor and optimizer state unchanged.
+- Loading into a deliberately different target reproduced the pre-mutation
+  cursor, model, optimizer, and aggregate state, not the post-mutation model
+  state. Direct loaded-model evidence was checked before applying the loaded
+  state to the target model.
+- The asynchronous checkpoint receipt was verified after save, after load, and
+  around receipt-bound promotion.
 - The separate registered child exit prevented promotion.
 - Missing metadata, a missing shard, and a one-byte shard corruption were
   rejected before DCP load and left the pre-existing sentinel pointer record
   byte-identical.
-- The public artifact contained no native checkpoint, raw marker or bootstrap
-  attestation, private-record path, launcher log, rendezvous value, or
-  environment value.
+- The public artifact contained no native checkpoint, standalone asynchronous
+  gate-marker or rank-report file, raw elastic marker, bootstrap attestation,
+  private-record path, launcher log, rendezvous value, environment value,
+  timing, or byte profile; it embedded only the validated fixed fields from
+  asynchronous rank reports.
 
 These claims apply only to the exact fixture, versions, process counts,
 single injected failure point, and protocol bound by the artifact and its
@@ -49,9 +68,11 @@ referenced source revision.
 - more than two processes, multiple hosts, elastic membership changes, scale
   up, or scale down;
 - failures at arbitrary training or checkpoint phases;
+- asynchronous-snapshot behavior for an arbitrary model, optimizer, stager,
+  writer, mutation, or training loop;
 - GPU, NCCL, FSDP, or device-failure recovery;
-- latency, recovery time, throughput, scalability, or resource-efficiency
-  conclusions;
+- latency, save overlap, recovery time, throughput, scalability, memory use,
+  checkpoint size, or resource-efficiency conclusions;
 - network filesystems, cloud object stores, machine loss, or power-loss
   durability;
 - high availability, production reliability, or general detached-process-tree
@@ -66,11 +87,13 @@ referenced source revision.
 - external adoption, independent reproduction, or third-party review.
 
 Synthetic tensors and controlled failures support only these state-integrity,
-elastic-launch, and control-plane boundaries. They are not evidence of
-industry-workload performance.
+staged-snapshot, elastic-launch, and control-plane boundaries. ResNet18 is a
+recognized fixed model construction here, but this synthetic execution is not
+evidence of training quality, production behavior, or industry-workload
+performance.
 
 ## Schema compatibility
 
-The v0.2 verifier accepts evidence schema v2 only. It does not validate the
-ten-scenario v1 inventory. The v1 protocol remains documented separately and
-requires the v0.1 verifier.
+The v0.3 verifier accepts evidence schema v3 only. It does not validate the
+eleven-scenario v2 or ten-scenario v1 inventory. Those protocols remain
+documented separately and require their matching v0.2 or v0.1 verifier.

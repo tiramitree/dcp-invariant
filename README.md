@@ -1,9 +1,9 @@
 # DCPInvariant
 
-DCPInvariant is a CPU-only evidence harness for exact restart invariants around
-PyTorch Distributed Checkpoint (DCP).
+DCPInvariant is a CPU-only evidence harness for exact state and snapshot
+invariants around PyTorch Distributed Checkpoint (DCP).
 
-It asks two bounded questions:
+It asks three bounded questions:
 
 1. for a deterministic registered training fixture, do model parameters,
    optimizer momentum, an explicit generator state, and a data cursor produce
@@ -12,16 +12,21 @@ It asks two bounded questions:
 2. does one fixed two-worker PyTorch elastic job reload the same committed DCP
    generation and reproduce that next-step state after its only registered
    restart?
+3. after the public DCP staging hook has completed for one fixed two-rank
+   ResNet18 workload, does an asynchronous save load the staged pre-mutation
+   state rather than a later, deliberately mutated model state?
 
-The v0.2 target is PyTorch 2.11.0 with NumPy 2.4.6 over single-host CPU/Gloo
-with one or two processes. The suite also checks DTensor global-tensor equality
-after 1-to-2 and 2-to-1 resharding, a separate worker-exit promotion gate,
-missing native files, and controlled shard corruption.
+The v0.3 target is PyTorch 2.11.0, torchvision 0.26.0, Pillow 12.3.0, and
+NumPy 2.4.6 over single-host CPU/Gloo with one or two processes. The suite also
+checks DTensor global-tensor equality after 1-to-2 and 2-to-1 resharding, a
+separate worker-exit promotion gate, missing native files, and controlled shard
+corruption.
 
 ## What the suite proves
 
-One run must pass eleven fixed scenarios:
+One run must pass twelve fixed scenarios:
 
+- asynchronous staged snapshot: fixed ResNet18 at two processes;
 - training restart: 1-to-1, 1-to-2, 2-to-1, and 2-to-2 processes;
 - elastic restart: one 2-to-2 job launched by
   `python -m torch.distributed.run --standalone --local-addr=127.0.0.1
@@ -66,12 +71,36 @@ cursor component digest. It requires both the checkpoint state and the next
 training state to match. DTensor evidence measures the reconstructed global
 tensor; it does not claim that local shard layouts are identical.
 
-A checkpoint is sealed by an ordinary-file inventory and SHA-256 receipt,
-promoted under the receipt digest, loaded only from that committed generation,
-and verified again after load. The elastic observation carries separately
-normalized pre-restart and post-restart receipt digests and requires them to be
-equal. The canonical generation pointer must also remain byte-identical during
-the failure and restart. No new post-failure promotion is attempted.
+The training, DTensor, and elastic positive checkpoints are sealed by an
+ordinary-file inventory and SHA-256 receipt, promoted under the receipt digest,
+loaded only from that committed generation, and verified again after load. The
+elastic observation carries separately normalized pre-restart and post-restart
+receipt digests and requires them to be equal. The canonical generation pointer
+must also remain byte-identical during the failure and restart. No new
+post-failure promotion is attempted. The asynchronous scenario instead seals
+and loads its candidate before the suite performs receipt-bound promotion; both
+the candidate load and the later committed generation are independently
+receipt-verified.
+
+The asynchronous scenario constructs the official
+`torchvision.models.resnet18(weights=None)` model without downloading weights
+or data. Two CPU/Gloo ranks perform one fixed synthetic SGD step and establish
+rank-consensus state digests. A package-owned `FileSystemWriter` subclass calls
+the public `FileSystemWriter.stage` hook, records the staged model, optimizer,
+and aggregate-state digests, and blocks the public `StorageWriter.write_data`
+hook before delegating to native checkpoint I/O. Once both ranks have completed
+staging, entered that write gate, and shown that the asynchronous future is
+still pending, the main thread changes only `model.conv1.weight` by one fixed
+scalar. It does not advance the application cursor, change the optimizer, or
+make an explicit process-group collective call while native writing is blocked.
+
+After the gate is released, the native checkpoint is sealed and loaded into a
+deliberately different target. A pass requires the staged and loaded model,
+optimizer, cursor, and aggregate-state digests to equal the pre-mutation
+digests; the post-mutation cursor and optimizer must remain equal to pre, while
+the post-mutation model and aggregate state must differ. The receipt is
+verified after save, after load, and again around receipt-bound promotion. This
+is a fixed correctness witness, not a timing or throughput benchmark.
 
 ## Run and verify
 
@@ -95,7 +124,7 @@ Then install the project and the exact official CPU runtime:
 
 ```text
 python -m pip install -e ".[dev,runtime]"
-python -m pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cpu
+python -m pip install torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cpu
 ```
 
 Run all scenarios into a path that does not already exist:
@@ -110,14 +139,17 @@ modules.
 
 The public artifact contains fixed-schema normalized observations, derived
 results, JUnit, provenance, and an unsigned SHA-256 manifest. Native `.metadata`
-and `.distcp` files, the raw elastic marker, the raw torchrun-bootstrap
-attestation, their filesystem locations, launcher logs, rendezvous values, and
-environment values are removed with the private temporary tree before the
-artifact directory is created. The artifact contains normalized fixed fields
-and canonical-file digests for both private records.
+and `.distcp` files, standalone asynchronous gate-marker and rank-report files,
+the raw elastic marker, the raw torchrun-bootstrap attestation, their
+filesystem locations, launcher logs, rendezvous values, and environment values
+are removed with the private temporary tree before the artifact directory is
+created. The validated fixed fields from asynchronous rank reports are embedded
+in the normalized observation; the artifact otherwise retains only normalized
+fixed fields and canonical-file digests needed by its registered contracts.
 
-Artifact schema v2 has eleven scenarios and is not byte- or inventory-compatible
-with v1. The v0.2 verifier accepts v2 only. Use the v0.1 release to verify a v1
+Artifact schema v3 has twelve scenarios and is not byte- or
+inventory-compatible with v2 or v1. The v0.3 verifier accepts v3 only. Use the
+v0.2 release to verify a v2 artifact and the v0.1 release to verify a v1
 artifact.
 
 ## Evidence and privacy boundary
@@ -126,9 +158,12 @@ This is an owner-operated pre-alpha project. It has no verified external
 users, adoption, independent reproduction, third-party review, production
 deployment, or recruiting outcome.
 
-The fixture uses small float64 tensors and binary-exact values. A pass does not
-establish bitwise determinism for arbitrary models, optimizers, datasets,
-kernels, failure points, or process topologies.
+The training and DTensor fixtures use small float64 tensors and binary-exact
+values. The asynchronous fixture uses the fixed FP32 ResNet18 construction,
+synthetic input, SGD step, public staging hook, write gate, and targeted
+mutation described above. A pass does not establish bitwise determinism or
+snapshot behavior for arbitrary models, optimizers, datasets, writers, kernels,
+failure points, or process topologies.
 
 DCPInvariant does **not** establish multi-node recovery, membership changes,
 GPU/NCCL or FSDP correctness, network-filesystem or power-loss durability,
@@ -138,15 +173,17 @@ official PyTorch certification.
 
 PyTorch DCP records its checkpoint identifier in `.metadata`. Workers therefore
 run with isolated temporary HOME, user, and temp values and receive only
-`checkpoint-one` or `checkpoint-two` as relative identifiers. Public evidence
-contains no native checkpoint, tensor values, absolute path, real username,
-hostname, process ID, port, environment, or worker log.
+`checkpoint-one`, `checkpoint-two`, or `checkpoint-async` as relative
+identifiers. Public evidence contains no native checkpoint, tensor values,
+absolute path, real username, hostname, process ID, port, environment, timing,
+byte profile, or worker log.
 
-See [the evidence schema](docs/evidence-schema-v2.md),
+See [the evidence schema](docs/evidence-schema-v3.md),
 [claim boundaries](docs/claim-boundaries.md), and
 [security model](docs/security-model.md).
 
 ## License
 
-Original code is licensed under Apache-2.0. PyTorch remains under its own
-BSD-3-Clause license and is not redistributed by this project.
+Original code is licensed under Apache-2.0. PyTorch, torchvision, NumPy, and
+Pillow remain under their own licenses and are not redistributed by this
+project.

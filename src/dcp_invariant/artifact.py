@@ -16,6 +16,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .async_snapshot_contract import (
+    ASYNC_CHECKPOINT_ID,
+    ASYNC_SNAPSHOT_ACTION,
+    ASYNC_SNAPSHOT_OBSERVATION_SCHEMA,
+    ASYNC_SNAPSHOT_REPORT_SCHEMA,
+    ASYNC_SNAPSHOT_SCENARIO,
+    ASYNC_WORLD_SIZE,
+    is_registered_torchvision_version_pair,
+    workload_contract,
+    workload_contract_digest,
+)
 from .canonical import canonical_json, exact_json_equal, sha256_json, strict_json_loads
 from .elastic_contract import (
     BOOTSTRAP_ATTESTATION_SCHEMA,
@@ -29,9 +40,9 @@ from .elastic_contract import (
     is_registered_torch_version_pair,
 )
 
-ARTIFACT_SCHEMA = "dcp-invariant-evidence-v2"
-RESULT_SCHEMA = "dcp-invariant-scenario-result-v2"
-SUMMARY_SCHEMA = "dcp-invariant-summary-v2"
+ARTIFACT_SCHEMA = "dcp-invariant-evidence-v3"
+RESULT_SCHEMA = "dcp-invariant-scenario-result-v3"
+SUMMARY_SCHEMA = "dcp-invariant-summary-v3"
 TRAINING_OBSERVATION_SCHEMA = "dcp-invariant-training-observation-v1"
 DTENSOR_OBSERVATION_SCHEMA = "dcp-invariant-dtensor-observation-v1"
 FAULT_OBSERVATION_SCHEMA = "dcp-invariant-fault-observation-v1"
@@ -122,6 +133,7 @@ class ScenarioSpec:
 
 
 SCENARIO_SPECS = (
+    ScenarioSpec(ASYNC_SNAPSHOT_SCENARIO, "async-staged-snapshot", 2, 2),
     ScenarioSpec("dtensor_1_to_2", "dtensor-exact-global-tensor", 1, 2),
     ScenarioSpec("dtensor_2_to_1", "dtensor-exact-global-tensor", 2, 1),
     ScenarioSpec("training_1_to_1", "training-exact-state", 1, 1),
@@ -169,6 +181,9 @@ SCENARIO_SPECS = (
 )
 REGISTERED_SCENARIOS = tuple(spec.name for spec in SCENARIO_SPECS)
 _SPECS_BY_NAME = {spec.name: spec for spec in SCENARIO_SPECS}
+_ASYNC_SCENARIOS = frozenset(
+    spec.name for spec in SCENARIO_SPECS if spec.category == "async-staged-snapshot"
+)
 _TRAINING_SCENARIOS = frozenset(
     spec.name for spec in SCENARIO_SPECS if spec.category == "training-exact-state"
 )
@@ -1146,6 +1161,213 @@ def _validate_fault_observation(
     return normalized, result
 
 
+def _validate_async_reports(value: object) -> list[dict[str, Any]]:
+    if type(value) is not list or len(value) != ASYNC_WORLD_SIZE:
+        raise EvidenceArtifactError("async rank report set is incomplete")
+    fields = frozenset(
+        {
+            "action",
+            "async_checkpointer",
+            "direct_loaded_model_sha256",
+            "future_pending_at_mutation",
+            "loaded_cursor_sha256",
+            "loaded_equals_post",
+            "loaded_equals_pre",
+            "loaded_model_sha256",
+            "loaded_optimizer_sha256",
+            "loaded_state_sha256",
+            "load_target_before_model_sha256",
+            "pillow_version",
+            "post_cursor_sha256",
+            "post_differs_from_pre",
+            "post_model_sha256",
+            "post_optimizer_sha256",
+            "post_state_sha256",
+            "pre_cursor_sha256",
+            "pre_model_sha256",
+            "pre_optimizer_sha256",
+            "pre_state_sha256",
+            "rank",
+            "receipt_sha256",
+            "receipt_verified_after_load",
+            "receipt_verified_after_save",
+            "report_schema",
+            "stage_call_count",
+            "stage_completed_before_mutation",
+            "staged_model_sha256",
+            "staged_optimizer_sha256",
+            "staged_state_sha256",
+            "torch_version",
+            "torchvision_distribution_version",
+            "torchvision_runtime_version",
+            "weights_downloaded",
+            "workload_contract_sha256",
+            "world_size",
+            "writer_gate_entered",
+            "writer_gate_released",
+        }
+    )
+    reports = [
+        _expect_exact_fields(report, fields, f"async rank {rank} report")
+        for rank, report in enumerate(value)
+    ]
+    digest_fields = tuple(field for field in fields if field.endswith("_sha256"))
+    for rank, report in enumerate(reports):
+        _expect_exact(report["action"], ASYNC_SNAPSHOT_ACTION, "async action")
+        _expect_exact(
+            report["async_checkpointer"],
+            "thread",
+            "async checkpointer",
+        )
+        _expect_exact(report["rank"], rank, "async rank")
+        _expect_exact(report["world_size"], ASYNC_WORLD_SIZE, "async world size")
+        _expect_exact(
+            report["report_schema"],
+            ASYNC_SNAPSHOT_REPORT_SCHEMA,
+            "async report schema",
+        )
+        _expect_exact(
+            report["stage_completed_before_mutation"],
+            True,
+            "async stage completion",
+        )
+        _expect_exact(report["stage_call_count"], 1, "async stage call count")
+        _expect_exact(
+            report["future_pending_at_mutation"],
+            True,
+            "async pending future witness",
+        )
+        _expect_exact(
+            report["writer_gate_entered"],
+            True,
+            "async writer gate entry",
+        )
+        _expect_exact(
+            report["writer_gate_released"],
+            True,
+            "async writer gate release",
+        )
+        _expect_exact(report["loaded_equals_pre"], True, "async pre equality")
+        _expect_exact(report["loaded_equals_post"], False, "async post inequality")
+        _expect_exact(
+            report["post_differs_from_pre"],
+            True,
+            "async mutation witness",
+        )
+        _expect_exact(
+            report["receipt_verified_after_save"],
+            True,
+            "async receipt after save",
+        )
+        _expect_exact(
+            report["receipt_verified_after_load"],
+            True,
+            "async receipt after load",
+        )
+        _expect_exact(report["weights_downloaded"], False, "weight download boundary")
+        _expect_exact(report["pillow_version"], "12.3.0", "Pillow version")
+        if type(report["torch_version"]) is not str or not _TORCH_VERSION.fullmatch(
+            report["torch_version"]
+        ):
+            raise EvidenceArtifactError("async PyTorch version is invalid")
+        if not is_registered_torchvision_version_pair(
+            report["torchvision_distribution_version"],
+            report["torchvision_runtime_version"],
+        ):
+            raise EvidenceArtifactError("async torchvision pair is invalid")
+        for field in digest_fields:
+            _require_sha256(report[field], field)
+        if report["workload_contract_sha256"] != workload_contract_digest():
+            raise EvidenceArtifactError("async workload contract differs")
+        if (
+            report["staged_model_sha256"] != report["pre_model_sha256"]
+            or report["staged_optimizer_sha256"] != report["pre_optimizer_sha256"]
+            or report["staged_state_sha256"] != report["pre_state_sha256"]
+        ):
+            raise EvidenceArtifactError("async staged state differs from pre state")
+        if (
+            report["loaded_cursor_sha256"] != report["pre_cursor_sha256"]
+            or report["loaded_model_sha256"] != report["pre_model_sha256"]
+            or report["loaded_optimizer_sha256"] != report["pre_optimizer_sha256"]
+            or report["loaded_state_sha256"] != report["pre_state_sha256"]
+        ):
+            raise EvidenceArtifactError("async loaded state differs from pre state")
+        if (
+            report["direct_loaded_model_sha256"] != report["pre_model_sha256"]
+            or report["load_target_before_model_sha256"] == report["pre_model_sha256"]
+        ):
+            raise EvidenceArtifactError("async load target witness is invalid")
+        if (
+            report["post_cursor_sha256"] != report["pre_cursor_sha256"]
+            or report["post_optimizer_sha256"] != report["pre_optimizer_sha256"]
+            or report["post_model_sha256"] == report["pre_model_sha256"]
+            or report["post_state_sha256"] == report["pre_state_sha256"]
+        ):
+            raise EvidenceArtifactError("async targeted mutation is invalid")
+    _require_report_consensus(reports, set(fields) - {"rank"})
+    return reports
+
+
+def _validate_async_observation(
+    value: object,
+    spec: ScenarioSpec,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    fields = frozenset(
+        {
+            "checkpoint_id",
+            "observation_schema",
+            "promotion_pointer",
+            "rank_reports",
+            "receipt_sha256",
+            "receipt_verified_after_load",
+            "receipt_verified_after_promotion",
+            "scenario",
+            "source_world_size",
+            "target_world_size",
+            "worker",
+            "workload",
+        }
+    )
+    observation = _expect_exact_fields(value, fields, spec.name)
+    _validate_positive_common(
+        observation,
+        spec,
+        expected_schema=ASYNC_SNAPSHOT_OBSERVATION_SCHEMA,
+        checkpoint_id=ASYNC_CHECKPOINT_ID,
+    )
+    _validate_worker_outcome(
+        observation["worker"],
+        world_size=ASYNC_WORLD_SIZE,
+        label="async worker",
+    )
+    if not exact_json_equal(observation["workload"], workload_contract()):
+        raise EvidenceArtifactError("async workload declaration is invalid")
+    reports = _validate_async_reports(observation["rank_reports"])
+    receipt_sha256 = _require_sha256(
+        observation["receipt_sha256"],
+        "async checkpoint receipt",
+    )
+    if reports[0]["receipt_sha256"] != receipt_sha256:
+        raise EvidenceArtifactError("async report receipt differs")
+    normalized = strict_json_loads(canonical_json(observation))
+    result = {
+        "contract_status": "pass",
+        "loaded_state_sha256": reports[0]["loaded_state_sha256"],
+        "observation_sha256": sha256_json(normalized),
+        "post_mutation_state_sha256": reports[0]["post_state_sha256"],
+        "pre_snapshot_state_sha256": reports[0]["pre_state_sha256"],
+        "promotion_allowed": True,
+        "receipt_sha256": receipt_sha256,
+        "result_schema": RESULT_SCHEMA,
+        "scenario": spec.name,
+        "source_world_size": spec.source_world_size,
+        "staged_state_sha256": reports[0]["staged_state_sha256"],
+        "target_world_size": spec.target_world_size,
+        "workload_contract_sha256": workload_contract_digest(),
+    }
+    return normalized, result
+
+
 def normalize_observation(
     value: Mapping[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -1154,7 +1376,9 @@ def normalize_observation(
     if type(value) is not dict:
         raise EvidenceArtifactError("observation must be one JSON object")
     spec = _registered_spec(value.get("scenario"))
-    if spec.name in _TRAINING_SCENARIOS:
+    if spec.name in _ASYNC_SCENARIOS:
+        observation, result = _validate_async_observation(value, spec)
+    elif spec.name in _TRAINING_SCENARIOS:
         observation, result = _validate_training_observation(value, spec)
     elif spec.name in _DTENSOR_SCENARIOS:
         observation, result = _validate_dtensor_observation(value, spec)
@@ -1318,12 +1542,27 @@ def _validate_bootstrap_runtime_alignment(
         )
 
 
+def _validate_async_runtime_alignment(
+    observations: Mapping[str, Mapping[str, Any]],
+    provenance: Mapping[str, Any],
+) -> None:
+    report_version = observations[ASYNC_SNAPSHOT_SCENARIO]["rank_reports"][0][
+        "torch_version"
+    ]
+    provenance_version = provenance["runtime"]["torch_version"]
+    if report_version != provenance_version:
+        raise EvidenceArtifactError(
+            "async worker and provenance PyTorch versions differ"
+        )
+
+
 def _build_summary(
     results: Mapping[str, Mapping[str, Any]],
 ) -> dict[str, Any]:
     return {
         "artifact_schema": SUMMARY_SCHEMA,
         "elastic_recoveries": len(_ELASTIC_SCENARIOS),
+        "async_snapshot_equalities": len(_ASYNC_SCENARIOS),
         "fault_rejections": len(_FAULT_SCENARIOS),
         "global_tensor_equalities": len(_DTENSOR_SCENARIOS),
         "overall_status": "pass",
@@ -1615,7 +1854,7 @@ def build_evidence_artifact(
     numpy_version: str,
     observations: Mapping[str, Mapping[str, Any]],
 ) -> VerifiedArtifact:
-    """Build the exact v2 artifact from validated execution observations."""
+    """Build the exact v3 artifact from validated execution observations."""
 
     if not isinstance(root, Path):
         raise EvidenceArtifactError("artifact root must be a pathlib.Path")
@@ -1630,6 +1869,7 @@ def build_evidence_artifact(
     _validate_bootstrap_runtime_alignment(normalized_observations, provenance)
     summary = _build_summary(results)
     _validate_summary(summary, results)
+    _validate_async_runtime_alignment(normalized_observations, provenance)
     try:
         root.mkdir()
         observations_root = root / "observations"
@@ -1684,6 +1924,7 @@ def verify_evidence_artifact(root: Path) -> VerifiedArtifact:
     }
     observations, derived_results = _validate_observations(parsed_observations)
     _validate_bootstrap_runtime_alignment(observations, provenance)
+    _validate_async_runtime_alignment(observations, provenance)
     parsed_results = {
         scenario: _parse_canonical_json_bytes(
             payloads[f"results/{scenario}.json"],
