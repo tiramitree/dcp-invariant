@@ -36,7 +36,7 @@ def test_registered_checkpoint_id_is_one_relative_name(checkpoint_id: str) -> No
         "checkpoint-three",
         "../checkpoint-one",
         "nested/checkpoint-one",
-        "C:\\checkpoint-one",
+        "C:" + chr(92) + "checkpoint-one",
     ],
 )
 def test_unregistered_checkpoint_id_is_rejected(checkpoint_id: str) -> None:

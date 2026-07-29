@@ -1,6 +1,6 @@
 # Claim boundaries
 
-## Supported by a passing v3 artifact
+## Supported by a passing v4 artifact
 
 - PyTorch 2.11.0 CPU/Gloo executed the fixed single-host fixtures.
 - DDP training state was saved at one or two processes and loaded at one or
@@ -49,8 +49,34 @@
   around receipt-bound promotion.
 - The separate registered child exit prevented promotion.
 - Missing metadata, a missing shard, and a one-byte shard corruption were
-  rejected before DCP load and left the pre-existing sentinel pointer record
-  byte-identical.
+  rejected before DCP load and left the pre-existing backed seed-generation
+  pointer byte-identical.
+- A real receipt- and lineage-backed v2 seed pointer was published first. Two
+  real local subprocesses each captured that same selected parent and committed
+  distinct immutable child generations before publication. The seed sequence
+  was zero and both child sequences were one.
+- A fixed A-then-B private unfenced reference arm ended on B, reproducing the
+  last-writer overwrite that the protected protocol is intended to prevent.
+  Its public evidence bound A's intermediate pointer digest before B's final
+  pointer, along with the commit barrier and fixed publish order.
+- In the matched protected arm, A published successfully and B returned
+  `stale_parent`; the final v2 pointer selected A, B remained an ordinary
+  unselected committed generation, and both generation-tree digests were
+  unchanged across publication.
+- A process exited with the registered code 73 after commit but before
+  publication; the surviving supervisor reloaded the committed descriptor and
+  published it without changing committed bytes.
+- A test-only post-publication hook exited with the registered code 74 after
+  pointer verification and lock release but before the publication function
+  returned; the surviving supervisor reloaded the descriptor, received
+  `already_published`, and left the pointer and committed bytes unchanged.
+- Forged parent digests, inconsistent parent sequences, and same-receipt reuse
+  under different lineage were rejected while candidates were preserved and
+  the selected pointer remained unchanged.
+- Every public v2 pointer was bound to its generation, canonical lineage-record
+  digest, selected-parent pointer digest, and sequence. Existing positive and
+  fault fixtures used backed committed generations rather than synthetic
+  pointer-only sentinels.
 - The public artifact contained no native checkpoint, standalone asynchronous
   gate-marker or rank-report file, raw elastic marker, bootstrap attestation,
   private-record path, launcher log, rendezvous value, environment value,
@@ -58,7 +84,8 @@
   asynchronous rank reports.
 
 These claims apply only to the exact fixture, versions, process counts,
-single injected failure point, and protocol bound by the artifact and its
+registered interleavings and injected failure points, ordinary local
+filesystem, cooperating processes, and protocol bound by the artifact and its
 referenced source revision.
 
 ## Not supported
@@ -75,11 +102,15 @@ referenced source revision.
   checkpoint size, or resource-efficiency conclusions;
 - network filesystems, cloud object stores, machine loss, or power-loss
   durability;
+- filesystem compare-and-swap, lock-free publication, multi-host consensus,
+  linearizability beyond the registered local interleaving, or correctness
+  against non-cooperating or hostile writers;
+- recovery from a process failure while a lineage record itself is only
+  partially written;
 - high availability, production reliability, or general detached-process-tree
   containment;
-- availability or validity of an older generation during the negative-control
-  cases; those cases establish only that the pre-existing canonical pointer
-  record remains byte-identical;
+- availability or validity of arbitrary older generations beyond the exact
+  backed synthetic seed and committed generations checked by the fixtures;
 - recovery from hostile or untrusted pickle-compatible metadata;
 - equivalence to an unmodified libuv rendezvous path or compatibility beyond
   the exact guarded PyTorch 2.11.0 c10d source;
@@ -94,6 +125,7 @@ performance.
 
 ## Schema compatibility
 
-The v0.3 verifier accepts evidence schema v3 only. It does not validate the
-eleven-scenario v2 or ten-scenario v1 inventory. Those protocols remain
-documented separately and require their matching v0.2 or v0.1 verifier.
+The v0.4 verifier accepts evidence schema v4 only. It does not validate the
+twelve-scenario v3, eleven-scenario v2, or ten-scenario v1 inventory. Those
+protocols remain documented separately and require their matching v0.3,
+v0.2, or v0.1 verifier.

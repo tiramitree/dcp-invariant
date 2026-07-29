@@ -60,11 +60,26 @@ from .elastic_contract import (
     is_registered_torch_version_pair,
 )
 from .elastic_supervisor import ElasticResult, run_elastic_workers
+from .lineage_worker import (
+    CRASH_AFTER_COMMIT_EXIT,
+    CRASH_AFTER_PUBLISH_EXIT,
+)
+from .lineage_worker import (
+    FIXTURE_SCHEMA as LINEAGE_FIXTURE_SCHEMA,
+)
+from .lineage_worker import (
+    REPORT_SCHEMA as LINEAGE_REPORT_SCHEMA,
+)
 from .supervisor import (
     LATEST_SCHEMA,
+    ParentVersion,
     SupervisorError,
     WorkerResult,
+    commit_candidate,
+    load_committed_generation,
     promote_candidate,
+    publish_committed_generation,
+    read_parent_version,
     run_workers,
 )
 
@@ -76,6 +91,7 @@ _POINTER_MAX_BYTES = 1024
 _CHECKPOINT_ONE = "checkpoint-one"
 _CHECKPOINT_TWO = "checkpoint-two"
 _ASYNC_SNAPSHOT_MODULE = "dcp_invariant.async_snapshot_worker"
+_LINEAGE_WORKER_MODULE = "dcp_invariant.lineage_worker"
 _WORKER_MODULE = "dcp_invariant.worker"
 _RANK_EXIT_MODULE = "dcp_invariant.rank_exit_worker"
 _STATE_COMPONENTS = ("cursor", "model", "optimizer", "rng", "state")
@@ -631,11 +647,36 @@ def _promotion_verifier(
 def _read_pointer(root: Path) -> tuple[dict[str, Any], str]:
     path = root / "LATEST.json"
     value = _read_canonical_object(path, _POINTER_MAX_BYTES, "promotion pointer")
-    if set(value) != {"generation", "pointer_schema"}:
+    if set(value) != {
+        "generation",
+        "lineage_sha256",
+        "parent_pointer_sha256",
+        "pointer_schema",
+        "sequence",
+    }:
         raise SuiteError("promotion pointer field set is invalid")
     _require_sha256(value["generation"], "promotion generation")
+    _require_sha256(value["lineage_sha256"], "promotion lineage")
+    parent = value["parent_pointer_sha256"]
+    if parent is not None:
+        _require_sha256(parent, "promotion parent")
+    sequence = value["sequence"]
+    if (
+        type(sequence) is not int
+        or not (0 <= sequence <= (2**63 - 1))
+        or (sequence > 0 and parent is None)
+    ):
+        raise SuiteError("promotion sequence is invalid")
     _require_exact(value["pointer_schema"], LATEST_SCHEMA, "pointer schema")
     digest = _hash_regular_file(path, _POINTER_MAX_BYTES, "promotion pointer")
+    try:
+        selected = read_parent_version(root)
+    except SupervisorError as error:
+        raise SuiteError(
+            "promotion pointer is not bound to one committed generation"
+        ) from error
+    if selected.pointer_sha256 != digest or selected.sequence != sequence:
+        raise SuiteError("promotion pointer version differs from its bytes")
     return value, digest
 
 
@@ -645,24 +686,48 @@ def _read_normalized_pointer(root: Path) -> dict[str, Any]:
 
 
 def _write_seed_pointer(root: Path) -> dict[str, Any]:
-    pointer = {
-        "generation": "0" * 64,
-        "pointer_schema": LATEST_SCHEMA,
-    }
-    raw = (canonical_json(pointer) + "\n").encode("utf-8")
-    path = root / "LATEST.json"
+    seed = root / "candidates" / "registered-seed"
+    checkpoint = seed / _CHECKPOINT_ONE
+    receipt = (
+        canonical_json(
+            {
+                "receipt_schema": "dcp-invariant-lineage-seed-v1",
+                "seed_ordinal": 0,
+            }
+        )
+        + "\n"
+    ).encode("utf-8")
     try:
-        with path.open("xb") as output:
-            output.write(raw)
+        checkpoint.mkdir(parents=True)
+        with (checkpoint / RECEIPT_NAME).open("xb") as output:
+            output.write(receipt)
             output.flush()
             os.fsync(output.fileno())
     except OSError as error:
-        raise SuiteError("cannot create the registered old pointer") from error
+        raise SuiteError("cannot create the registered seed generation") from error
+    generation = hashlib.sha256(receipt).hexdigest()
+
+    def verify_seed(value: Path) -> bool:
+        try:
+            return (
+                value.name == _CHECKPOINT_ONE
+                and (value / RECEIPT_NAME).read_bytes() == receipt
+            )
+        except OSError:
+            return False
+
+    target = promote_candidate(
+        root=root,
+        candidate=seed,
+        logical_checkpoint_id=_CHECKPOINT_ONE,
+        verify=verify_seed,
+    )
+    if target.name != generation:
+        raise SuiteError("registered seed generation changed during promotion")
     observed = _read_normalized_pointer(root)
-    digest = observed.pop("pointer_sha256")
-    if not exact_json_equal(observed, pointer):
-        raise SuiteError("registered old pointer changed during creation")
-    return {**pointer, "pointer_sha256": digest}
+    if observed["generation"] != generation:
+        raise SuiteError("registered seed pointer differs from its receipt")
+    return observed
 
 
 def _compare_training_reports(
@@ -977,8 +1042,11 @@ def _run_receipt_fault(
         committed_entries = list((layout.root / "committed").iterdir())
     except OSError as error:
         raise SuiteError("committed generation directory cannot be read") from error
-    if committed_entries:
-        raise SuiteError("fault rejection created a committed generation")
+    expected_seed = pointer_before["generation"]
+    if {entry.name for entry in committed_entries} != {expected_seed}:
+        raise SuiteError(
+            "fault rejection changed the registered committed seed inventory"
+        )
     pointer_after = _read_normalized_pointer(layout.root)
     if not exact_json_equal(pointer_after, pointer_before):
         raise SuiteError("fault rejection changed the old promotion pointer")
@@ -1564,7 +1632,7 @@ def run_suite(
     rank_exit_runner: RankExitRunner | None = None,
     elastic_runner: ElasticRunner | None = None,
 ) -> SuiteRun:
-    """Run all twelve registered scenarios and create one offline artifact.
+    """Run all thirteen registered scenarios and create one offline artifact.
 
     ``output_root`` must start absent.  No public file is created until the
     temporary native-checkpoint tree has been removed successfully.
@@ -1596,6 +1664,11 @@ def run_suite(
     with tempfile.TemporaryDirectory(prefix="dcp-invariant-") as temporary:
         native_root = Path(temporary)
         _ordinary_directory(native_root, "native temporary root")
+        lineage_scenario = "generation_lineage_stale_writer_2p"
+        observations[lineage_scenario] = _run_generation_lineage_scenario(
+            native_root / lineage_scenario,
+            timeout_seconds=timeout_seconds,
+        )
 
         (
             async_observation,
@@ -1713,3 +1786,582 @@ def run_suite(
         observations=observations,
         native_work_cleaned=True,
     )
+
+
+def _make_lineage_root(root: Path) -> dict[str, Path]:
+    try:
+        root.mkdir()
+        result = {
+            "candidates": root / "candidates",
+            "committed": root / "committed",
+            "coordination": root / "coordination",
+            "reports": root / "reports",
+            "worker_home": root / "worker-home",
+        }
+        for directory in result.values():
+            directory.mkdir()
+    except OSError as error:
+        raise SuiteError("cannot create the lineage scenario layout") from error
+    return result
+
+
+def _lineage_fixture_receipt(ordinal: int) -> bytes:
+    return (
+        canonical_json(
+            {
+                "fixture_schema": LINEAGE_FIXTURE_SCHEMA,
+                "ordinal": ordinal,
+            }
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
+def _lineage_fixture_verifier(receipt: bytes) -> Callable[[Path], bool]:
+    def verify(checkpoint: Path) -> bool:
+        try:
+            return (
+                checkpoint.name == _CHECKPOINT_ONE
+                and (checkpoint / RECEIPT_NAME).read_bytes() == receipt
+            )
+        except OSError:
+            return False
+
+    return verify
+
+
+def _make_lineage_candidate(
+    root: Path,
+    *,
+    name: str,
+    ordinal: int,
+) -> tuple[Path, bytes]:
+    wrapper = root / "candidates" / name
+    checkpoint = wrapper / _CHECKPOINT_ONE
+    receipt = _lineage_fixture_receipt(ordinal)
+    try:
+        checkpoint.mkdir(parents=True)
+        with (checkpoint / RECEIPT_NAME).open("xb") as output:
+            output.write(receipt)
+            output.flush()
+            os.fsync(output.fileno())
+    except OSError as error:
+        raise SuiteError("cannot create a lineage rejection candidate") from error
+    return wrapper, receipt
+
+
+def _lineage_tree_digest(root: Path) -> str:
+    _ordinary_directory(root, "committed lineage generation")
+    records: list[dict[str, str]] = []
+    try:
+        entries = sorted(root.rglob("*"), key=lambda value: value.as_posix())
+    except OSError as error:
+        raise SuiteError("committed lineage generation cannot be enumerated") from error
+    for entry in entries:
+        try:
+            value = entry.lstat()
+        except OSError as error:
+            raise SuiteError("committed lineage entry cannot be inspected") from error
+        relative = entry.relative_to(root).as_posix()
+        if entry.is_symlink() or _is_reparse(value):
+            raise SuiteError("committed lineage generation contains a link")
+        if stat.S_ISDIR(value.st_mode):
+            records.append({"kind": "directory", "name": relative})
+        elif stat.S_ISREG(value.st_mode):
+            raw = _read_regular_bytes(
+                entry,
+                128 * 1024,
+                "committed lineage file",
+            )
+            records.append(
+                {
+                    "kind": "file",
+                    "name": relative,
+                    "sha256": hashlib.sha256(raw).hexdigest(),
+                }
+            )
+        else:
+            raise SuiteError("committed lineage generation contains a special entry")
+    return hashlib.sha256(canonical_json(records).encode("utf-8")).hexdigest()
+
+
+def _read_lineage_reports(
+    root: Path,
+    *,
+    mode: str,
+    starting_pointer: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    _ordinary_directory(root, "lineage report directory")
+    try:
+        entries = {entry.name: entry for entry in root.iterdir()}
+    except OSError as error:
+        raise SuiteError("lineage report directory cannot be enumerated") from error
+    if set(entries) != {"rank-0.json", "rank-1.json"}:
+        raise SuiteError("lineage report rank set is incomplete")
+    fields = {
+        "commit_barrier_passed",
+        "generation",
+        "generation_tree_sha256_before",
+        "lineage_sha256",
+        "mode",
+        "outcome",
+        "parent_pointer_sha256",
+        "pointer_sequence_after_action",
+        "pointer_sha256_after_action",
+        "publish_ordinal",
+        "rank",
+        "report_schema",
+        "sequence",
+    }
+    reports: list[dict[str, Any]] = []
+    for rank in range(2):
+        report = _read_canonical_object(
+            entries[f"rank-{rank}.json"],
+            _REPORT_MAX_BYTES,
+            "lineage worker report",
+        )
+        if set(report) != fields:
+            raise SuiteError("lineage worker report field set is invalid")
+        _require_exact(report["report_schema"], LINEAGE_REPORT_SCHEMA, "lineage report")
+        _require_exact(report["mode"], mode, "lineage worker mode")
+        _require_exact_int(report["rank"], rank, "lineage worker rank")
+        _require_sha256(report["generation"], "lineage generation")
+        _require_sha256(report["lineage_sha256"], "lineage record")
+        _require_sha256(
+            report["generation_tree_sha256_before"],
+            "lineage generation tree",
+        )
+        _require_exact(
+            report["commit_barrier_passed"],
+            True,
+            "lineage commit barrier",
+        )
+        _require_exact(
+            report["parent_pointer_sha256"],
+            starting_pointer["pointer_sha256"],
+            "lineage parent",
+        )
+        _require_exact_int(
+            report["sequence"],
+            starting_pointer["sequence"] + 1,
+            "lineage sequence",
+        )
+        _require_sha256(
+            report["pointer_sha256_after_action"],
+            "lineage pointer after action",
+        )
+        _require_exact_int(
+            report["pointer_sequence_after_action"],
+            starting_pointer["sequence"] + 1,
+            "lineage pointer sequence after action",
+        )
+        _require_exact_int(report["publish_ordinal"], rank, "publish ordinal")
+        reports.append(report)
+    if reports[0]["generation"] == reports[1]["generation"]:
+        raise SuiteError("lineage workers did not commit distinct generations")
+    return reports
+
+
+def _run_lineage_arm(
+    root: Path,
+    *,
+    mode: str,
+    timeout_seconds: float,
+) -> dict[str, Any]:
+    layout = _make_lineage_root(root)
+    starting_pointer = _write_seed_pointer(root)
+    barrier_timeout = min(timeout_seconds, 60.0)
+    result = run_workers(
+        module=_LINEAGE_WORKER_MODULE,
+        common_arguments=[
+            "--mode",
+            mode,
+            "--root",
+            str(root),
+            "--coordination",
+            str(layout["coordination"]),
+            "--report-dir",
+            str(layout["reports"]),
+            "--barrier-timeout-seconds",
+            str(barrier_timeout),
+        ],
+        world_size=2,
+        cwd=root,
+        isolated_home=layout["worker_home"],
+        timeout_seconds=timeout_seconds,
+    )
+    reports = _read_lineage_reports(
+        layout["reports"],
+        mode=mode,
+        starting_pointer=starting_pointer,
+    )
+    pointer = _read_normalized_pointer(root)
+    try:
+        committed = {entry.name: entry for entry in layout["committed"].iterdir()}
+    except OSError as error:
+        raise SuiteError("lineage committed inventory cannot be read") from error
+    expected_generations = {
+        starting_pointer["generation"],
+        *(report["generation"] for report in reports),
+    }
+    if set(committed) != expected_generations:
+        raise SuiteError("lineage committed inventory is incomplete")
+    trees_after: dict[str, str] = {}
+    for report in reports:
+        after = _lineage_tree_digest(committed[report["generation"]])
+        trees_after[report["generation"]] = after
+        if after != report["generation_tree_sha256_before"]:
+            raise SuiteError("committed generation changed during publication")
+
+    child_pointer_sha256: list[str] = []
+    for report in reports:
+        payload = {
+            "generation": report["generation"],
+            "lineage_sha256": report["lineage_sha256"],
+            "parent_pointer_sha256": starting_pointer["pointer_sha256"],
+            "pointer_schema": LATEST_SCHEMA,
+            "sequence": starting_pointer["sequence"] + 1,
+        }
+        child_pointer_sha256.append(
+            hashlib.sha256((canonical_json(payload) + "\n").encode("utf-8")).hexdigest()
+        )
+    if reports[0]["pointer_sha256_after_action"] != child_pointer_sha256[0]:
+        raise SuiteError("first lineage publication was not observed")
+
+    if mode == "control":
+        expected_outcomes = ["published_unfenced", "published_unfenced"]
+        selected_rank = 1
+    elif mode == "protected":
+        expected_outcomes = ["published", "stale_parent"]
+        selected_rank = 0
+    else:
+        raise SuiteError("lineage arm mode is not registered")
+    if [report["outcome"] for report in reports] != expected_outcomes:
+        raise SuiteError("lineage publication outcomes are invalid")
+    if reports[1]["pointer_sha256_after_action"] != child_pointer_sha256[selected_rank]:
+        raise SuiteError("second lineage action selected the wrong pointer")
+    if pointer["generation"] != reports[selected_rank]["generation"]:
+        raise SuiteError("lineage final pointer selected the wrong child")
+    _require_exact(
+        pointer["lineage_sha256"],
+        reports[selected_rank]["lineage_sha256"],
+        "lineage final record",
+    )
+    _require_exact_int(
+        pointer["sequence"],
+        starting_pointer["sequence"] + 1,
+        "lineage final sequence",
+    )
+    _require_exact(
+        pointer["parent_pointer_sha256"],
+        starting_pointer["pointer_sha256"],
+        "lineage final parent",
+    )
+    _require_exact(
+        pointer["pointer_sha256"],
+        child_pointer_sha256[selected_rank],
+        "lineage final pointer digest",
+    )
+    reference_overwrite = (
+        mode == "control"
+        and reports[0]["pointer_sha256_after_action"] != pointer["pointer_sha256"]
+    )
+    return {
+        "committed_generation_count": len(committed),
+        "both_committed_before_publication": True,
+        "final_generation_sha256": pointer["generation"],
+        "final_pointer": pointer,
+        "first_generation_sha256": reports[0]["generation"],
+        "first_generation_tree_sha256_after": trees_after[reports[0]["generation"]],
+        "first_generation_tree_sha256_before": reports[0][
+            "generation_tree_sha256_before"
+        ],
+        "first_lineage_sha256": reports[0]["lineage_sha256"],
+        "first_outcome": reports[0]["outcome"],
+        "first_pointer_sha256_after_publish": reports[0]["pointer_sha256_after_action"],
+        "generation_bytes_unchanged": True,
+        "publish_order": [0, 1],
+        "reference_overwrite_observed": reference_overwrite,
+        "second_generation_sha256": reports[1]["generation"],
+        "second_generation_tree_sha256_after": trees_after[reports[1]["generation"]],
+        "second_generation_tree_sha256_before": reports[1][
+            "generation_tree_sha256_before"
+        ],
+        "second_lineage_sha256": reports[1]["lineage_sha256"],
+        "second_outcome": reports[1]["outcome"],
+        "selected_ordinal": selected_rank,
+        "starting_pointer": starting_pointer,
+        "stale_orphan_preserved": mode == "protected",
+        "stale_writer_rejected": mode == "protected",
+        "worker": _worker_observation(result),
+    }
+
+
+def _read_recovery_record(path: Path) -> dict[str, Any]:
+    record = _read_canonical_object(
+        path,
+        _REPORT_MAX_BYTES,
+        "lineage recovery record",
+    )
+    if set(record) != {
+        "generation",
+        "generation_tree_sha256_before",
+        "outcome_before_exit",
+    }:
+        raise SuiteError("lineage recovery record field set is invalid")
+    _require_sha256(record["generation"], "recovery generation")
+    _require_sha256(
+        record["generation_tree_sha256_before"],
+        "recovery generation tree",
+    )
+    return record
+
+
+def _run_lineage_recovery(
+    root: Path,
+    *,
+    mode: str,
+    timeout_seconds: float,
+) -> dict[str, Any]:
+    layout = _make_lineage_root(root)
+    starting_pointer = _write_seed_pointer(root)
+    if mode == "crash-after-commit":
+        expected_exit = CRASH_AFTER_COMMIT_EXIT
+        expected_before = "committed"
+        expected_recovery = "published"
+    elif mode == "crash-after-publish":
+        expected_exit = CRASH_AFTER_PUBLISH_EXIT
+        expected_before = "publication_return_lost"
+        expected_recovery = "already_published"
+    else:
+        raise SuiteError("lineage recovery mode is not registered")
+    result = run_workers(
+        module=_LINEAGE_WORKER_MODULE,
+        common_arguments=[
+            "--mode",
+            mode,
+            "--root",
+            str(root),
+            "--coordination",
+            str(layout["coordination"]),
+            "--report-dir",
+            str(layout["reports"]),
+        ],
+        world_size=1,
+        cwd=root,
+        isolated_home=layout["worker_home"],
+        timeout_seconds=timeout_seconds,
+        expected_exit_codes=(expected_exit,),
+    )
+    record = _read_recovery_record(layout["coordination"] / "recovery.json")
+    _require_exact(
+        record["outcome_before_exit"],
+        expected_before,
+        "recovery pre-exit outcome",
+    )
+    receipt = _lineage_fixture_receipt(0)
+    generation = hashlib.sha256(receipt).hexdigest()
+    if record["generation"] != generation:
+        raise SuiteError("recovery record generation differs from its receipt")
+    verifier = _lineage_fixture_verifier(receipt)
+    recovered = load_committed_generation(
+        root=root,
+        generation=generation,
+        logical_checkpoint_id=_CHECKPOINT_ONE,
+        verify=verifier,
+    )
+    if (
+        recovered.parent_pointer_sha256 != starting_pointer["pointer_sha256"]
+        or recovered.sequence != starting_pointer["sequence"] + 1
+    ):
+        raise SuiteError("recovered generation differs from its selected parent")
+    tree_after = _lineage_tree_digest(recovered.target)
+    if tree_after != record["generation_tree_sha256_before"]:
+        raise SuiteError("recovered committed generation bytes changed")
+    pointer_before_retry = _read_normalized_pointer(root)
+    recovery_outcome = publish_committed_generation(
+        root=root,
+        committed=recovered,
+        verify=verifier,
+    )
+    if recovery_outcome != expected_recovery:
+        raise SuiteError("lineage recovery outcome is invalid")
+    pointer_after_retry = _read_normalized_pointer(root)
+    if pointer_after_retry["generation"] != generation:
+        raise SuiteError("lineage recovery selected the wrong generation")
+    pointer_unchanged = exact_json_equal(
+        pointer_before_retry,
+        pointer_after_retry,
+    )
+    if mode == "crash-after-commit" and (
+        pointer_unchanged
+        or not exact_json_equal(pointer_before_retry, starting_pointer)
+    ):
+        raise SuiteError("commit-window recovery did not advance its parent")
+    if mode == "crash-after-publish" and not pointer_unchanged:
+        raise SuiteError("idempotent lineage retry changed the selected pointer")
+    return {
+        "exit_code": expected_exit,
+        "generation_bytes_unchanged": True,
+        "generation_sha256": generation,
+        "generation_tree_sha256_after": tree_after,
+        "generation_tree_sha256_before": record["generation_tree_sha256_before"],
+        "outcome_before_exit": expected_before,
+        "pointer_after_retry": pointer_after_retry,
+        "pointer_unchanged_on_retry": pointer_unchanged,
+        "recovery_outcome": recovery_outcome,
+        "starting_pointer": starting_pointer,
+        "worker": _worker_observation(result),
+    }
+
+
+def _captured_supervisor_code(action: Callable[[], object]) -> str:
+    try:
+        action()
+    except SupervisorError as error:
+        return str(error)
+    raise SuiteError("registered lineage rejection unexpectedly succeeded")
+
+
+def _run_lineage_rejections(root: Path) -> dict[str, Any]:
+    try:
+        root.mkdir()
+    except OSError as error:
+        raise SuiteError("cannot create lineage rejection roots") from error
+    forged_root = root / "forged-parent"
+    forged_layout = _make_lineage_root(forged_root)
+    forged_candidate, forged_receipt = _make_lineage_candidate(
+        forged_root,
+        name="candidate",
+        ordinal=0,
+    )
+    forged_code = _captured_supervisor_code(
+        lambda: commit_candidate(
+            root=forged_root,
+            candidate=forged_candidate,
+            logical_checkpoint_id=_CHECKPOINT_ONE,
+            verify=_lineage_fixture_verifier(forged_receipt),
+            parent=ParentVersion("f" * 64, -1),
+        )
+    )
+    if _entry_exists(forged_root / "LATEST.json") or list(
+        forged_layout["committed"].iterdir()
+    ):
+        raise SuiteError("forged lineage parent changed durable state")
+
+    sequence_root = root / "sequence-mismatch"
+    sequence_layout = _make_lineage_root(sequence_root)
+    sequence_candidate, sequence_receipt = _make_lineage_candidate(
+        sequence_root,
+        name="candidate",
+        ordinal=0,
+    )
+    sequence_code = _captured_supervisor_code(
+        lambda: commit_candidate(
+            root=sequence_root,
+            candidate=sequence_candidate,
+            logical_checkpoint_id=_CHECKPOINT_ONE,
+            verify=_lineage_fixture_verifier(sequence_receipt),
+            parent=ParentVersion(None, 0),
+        )
+    )
+    if _entry_exists(sequence_root / "LATEST.json") or list(
+        sequence_layout["committed"].iterdir()
+    ):
+        raise SuiteError("lineage sequence mismatch changed durable state")
+
+    conflict_root = root / "lineage-conflict"
+    _make_lineage_root(conflict_root)
+    first_candidate, first_receipt = _make_lineage_candidate(
+        conflict_root,
+        name="candidate-first",
+        ordinal=0,
+    )
+    first_verifier = _lineage_fixture_verifier(first_receipt)
+    first = commit_candidate(
+        root=conflict_root,
+        candidate=first_candidate,
+        logical_checkpoint_id=_CHECKPOINT_ONE,
+        verify=first_verifier,
+        parent=read_parent_version(conflict_root),
+    )
+    publish_committed_generation(
+        root=conflict_root,
+        committed=first,
+        verify=first_verifier,
+    )
+    pointer_before = _read_normalized_pointer(conflict_root)
+    conflict_candidate, conflict_receipt = _make_lineage_candidate(
+        conflict_root,
+        name="candidate-conflict",
+        ordinal=0,
+    )
+    conflict_code = _captured_supervisor_code(
+        lambda: commit_candidate(
+            root=conflict_root,
+            candidate=conflict_candidate,
+            logical_checkpoint_id=_CHECKPOINT_ONE,
+            verify=_lineage_fixture_verifier(conflict_receipt),
+            parent=read_parent_version(conflict_root),
+        )
+    )
+    pointer_after = _read_normalized_pointer(conflict_root)
+    if not exact_json_equal(pointer_before, pointer_after):
+        raise SuiteError("lineage conflict changed the selected pointer")
+    if not (
+        forged_candidate.is_dir()
+        and sequence_candidate.is_dir()
+        and conflict_candidate.is_dir()
+    ):
+        raise SuiteError("lineage rejection did not preserve its candidate")
+    if (
+        forged_code != "parent_version_invalid"
+        or sequence_code != "parent_version_invalid"
+        or conflict_code != "generation_lineage_conflict"
+    ):
+        raise SuiteError("lineage rejection code is outside the contract")
+    return {
+        "candidates_preserved": True,
+        "forged_parent": forged_code,
+        "lineage_conflict": conflict_code,
+        "pointers_unchanged": True,
+        "sequence_mismatch": sequence_code,
+    }
+
+
+def _run_generation_lineage_scenario(
+    root: Path,
+    *,
+    timeout_seconds: float,
+) -> dict[str, Any]:
+    try:
+        root.mkdir()
+    except OSError as error:
+        raise SuiteError("cannot create the generation lineage scenario") from error
+    return {
+        "control": _run_lineage_arm(
+            root / "control",
+            mode="control",
+            timeout_seconds=timeout_seconds,
+        ),
+        "observation_schema": ("dcp-invariant-generation-lineage-observation-v1"),
+        "protected": _run_lineage_arm(
+            root / "protected",
+            mode="protected",
+            timeout_seconds=timeout_seconds,
+        ),
+        "recovery_after_commit": _run_lineage_recovery(
+            root / "recovery-after-commit",
+            mode="crash-after-commit",
+            timeout_seconds=timeout_seconds,
+        ),
+        "recovery_after_publish": _run_lineage_recovery(
+            root / "recovery-after-publish",
+            mode="crash-after-publish",
+            timeout_seconds=timeout_seconds,
+        ),
+        "rejections": _run_lineage_rejections(root / "rejections"),
+        "scenario": "generation_lineage_stale_writer_2p",
+        "publisher_process_count": 2,
+        "selected_head_count": 1,
+    }

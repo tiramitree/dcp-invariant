@@ -1,3 +1,3 @@
-"""DCPInvariant: exact state and snapshot invariants for PyTorch checkpoints."""
+"""DCPInvariant: exact state, snapshot, and lineage checkpoint invariants."""
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"

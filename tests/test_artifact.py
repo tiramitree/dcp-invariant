@@ -51,8 +51,29 @@ def digest(label: str) -> str:
     return hashlib.sha256(label.encode("utf-8")).hexdigest()
 
 
-def pointer(generation: str) -> dict[str, object]:
-    value = {"generation": generation, "pointer_schema": LATEST_SCHEMA}
+def pointer(
+    generation: str,
+    checkpoint_id: str = "checkpoint-one",
+    *,
+    parent_pointer_sha256: str | None = None,
+    sequence: int = 0,
+) -> dict[str, object]:
+    lineage = {
+        "generation": generation,
+        "lineage_schema": "dcp-invariant-generation-lineage-v1",
+        "logical_checkpoint_id": checkpoint_id,
+        "parent_pointer_sha256": parent_pointer_sha256,
+        "sequence": sequence,
+    }
+    value = {
+        "generation": generation,
+        "lineage_sha256": hashlib.sha256(
+            (canonical_json(lineage) + "\n").encode()
+        ).hexdigest(),
+        "parent_pointer_sha256": parent_pointer_sha256,
+        "pointer_schema": LATEST_SCHEMA,
+        "sequence": sequence,
+    }
     return {
         **value,
         "pointer_sha256": hashlib.sha256(
@@ -165,7 +186,7 @@ def async_observation() -> dict[str, object]:
     return {
         "checkpoint_id": ASYNC_CHECKPOINT_ID,
         "observation_schema": ASYNC_SNAPSHOT_OBSERVATION_SCHEMA,
-        "promotion_pointer": pointer(receipt),
+        "promotion_pointer": pointer(receipt, ASYNC_CHECKPOINT_ID),
         "rank_reports": reports,
         "receipt_sha256": receipt,
         "receipt_verified_after_load": True,
@@ -191,7 +212,7 @@ def positive_common(
         "checkpoint_id": checkpoint_id,
         "load_worker": worker_outcome(target_world_size),
         "observation_schema": schema,
-        "promotion_pointer": pointer(receipt),
+        "promotion_pointer": pointer(receipt, checkpoint_id),
         "receipt_sha256": receipt,
         "receipt_verified_after_load": True,
         "receipt_verified_after_promotion": True,
@@ -398,6 +419,120 @@ def receipt_fault_observation(scenario: str) -> dict[str, object]:
     }
 
 
+def lineage_observation() -> dict[str, object]:
+    seed = digest("lineage-seed")
+    first = digest("lineage-first")
+    second = digest("lineage-second")
+    first_tree = digest("lineage-first-tree")
+    second_tree = digest("lineage-second-tree")
+    starting_pointer = pointer(seed)
+    parent_pointer_sha256 = starting_pointer["pointer_sha256"]
+    assert isinstance(parent_pointer_sha256, str)
+    first_pointer = pointer(
+        first,
+        parent_pointer_sha256=parent_pointer_sha256,
+        sequence=1,
+    )
+    second_pointer = pointer(
+        second,
+        parent_pointer_sha256=parent_pointer_sha256,
+        sequence=1,
+    )
+    control = {
+        "both_committed_before_publication": True,
+        "committed_generation_count": 3,
+        "final_generation_sha256": second,
+        "final_pointer": second_pointer,
+        "first_generation_sha256": first,
+        "first_generation_tree_sha256_after": first_tree,
+        "first_generation_tree_sha256_before": first_tree,
+        "first_lineage_sha256": first_pointer["lineage_sha256"],
+        "first_outcome": "published_unfenced",
+        "first_pointer_sha256_after_publish": first_pointer["pointer_sha256"],
+        "generation_bytes_unchanged": True,
+        "publish_order": [0, 1],
+        "reference_overwrite_observed": True,
+        "second_generation_sha256": second,
+        "second_generation_tree_sha256_after": second_tree,
+        "second_generation_tree_sha256_before": second_tree,
+        "second_lineage_sha256": second_pointer["lineage_sha256"],
+        "second_outcome": "published_unfenced",
+        "selected_ordinal": 1,
+        "starting_pointer": starting_pointer,
+        "stale_orphan_preserved": False,
+        "stale_writer_rejected": False,
+        "worker": worker_outcome(2),
+    }
+    protected = {
+        "both_committed_before_publication": True,
+        "committed_generation_count": 3,
+        "final_generation_sha256": first,
+        "final_pointer": first_pointer,
+        "first_generation_sha256": first,
+        "first_generation_tree_sha256_after": first_tree,
+        "first_generation_tree_sha256_before": first_tree,
+        "first_lineage_sha256": first_pointer["lineage_sha256"],
+        "first_outcome": "published",
+        "first_pointer_sha256_after_publish": first_pointer["pointer_sha256"],
+        "generation_bytes_unchanged": True,
+        "publish_order": [0, 1],
+        "reference_overwrite_observed": False,
+        "second_generation_sha256": second,
+        "second_generation_tree_sha256_after": second_tree,
+        "second_generation_tree_sha256_before": second_tree,
+        "second_lineage_sha256": second_pointer["lineage_sha256"],
+        "second_outcome": "stale_parent",
+        "selected_ordinal": 0,
+        "starting_pointer": starting_pointer,
+        "stale_orphan_preserved": True,
+        "stale_writer_rejected": True,
+        "worker": worker_outcome(2),
+    }
+    recovery_after_commit = {
+        "exit_code": 73,
+        "generation_bytes_unchanged": True,
+        "generation_sha256": first,
+        "generation_tree_sha256_after": first_tree,
+        "generation_tree_sha256_before": first_tree,
+        "outcome_before_exit": "committed",
+        "pointer_after_retry": first_pointer,
+        "pointer_unchanged_on_retry": False,
+        "recovery_outcome": "published",
+        "starting_pointer": starting_pointer,
+        "worker": {"exit_codes": [73], "timed_out": False},
+    }
+    recovery_after_publish = {
+        "exit_code": 74,
+        "generation_bytes_unchanged": True,
+        "generation_sha256": first,
+        "generation_tree_sha256_after": first_tree,
+        "generation_tree_sha256_before": first_tree,
+        "outcome_before_exit": "publication_return_lost",
+        "pointer_after_retry": first_pointer,
+        "pointer_unchanged_on_retry": True,
+        "recovery_outcome": "already_published",
+        "starting_pointer": starting_pointer,
+        "worker": {"exit_codes": [74], "timed_out": False},
+    }
+    return {
+        "control": control,
+        "observation_schema": ("dcp-invariant-generation-lineage-observation-v1"),
+        "protected": protected,
+        "recovery_after_commit": recovery_after_commit,
+        "recovery_after_publish": recovery_after_publish,
+        "rejections": {
+            "candidates_preserved": True,
+            "forged_parent": "parent_version_invalid",
+            "lineage_conflict": "generation_lineage_conflict",
+            "pointers_unchanged": True,
+            "sequence_mismatch": "parent_version_invalid",
+        },
+        "scenario": "generation_lineage_stale_writer_2p",
+        "publisher_process_count": 2,
+        "selected_head_count": 1,
+    }
+
+
 def complete_observations() -> dict[str, dict[str, object]]:
     return {
         "dtensor_1_to_2": dtensor_observation("dtensor_1_to_2", 1, 2),
@@ -408,6 +543,7 @@ def complete_observations() -> dict[str, dict[str, object]]:
         "training_2_to_1": training_observation("training_2_to_1", 2, 1),
         "training_2_to_2": training_observation("training_2_to_2", 2, 2),
         "elastic_restart_2_to_2": elastic_observation(),
+        "generation_lineage_stale_writer_2p": lineage_observation(),
         "rank_exit_no_promotion": rank_exit_observation(),
         "missing_metadata": receipt_fault_observation("missing_metadata"),
         "missing_shard": receipt_fault_observation("missing_shard"),
@@ -470,12 +606,13 @@ def test_round_trip_binds_observations_results_and_fixed_inventory(
     assert set(verified.observations) == set(REGISTERED_SCENARIOS)
     assert verified.summary["async_snapshot_equalities"] == 1
     assert set(verified.results) == set(REGISTERED_SCENARIOS)
-    assert verified.summary["passed_scenarios"] == 12
+    assert verified.summary["passed_scenarios"] == 13
     assert verified.summary["state_equalities"] == 4
     assert verified.summary["elastic_recoveries"] == 1
     assert verified.summary["global_tensor_equalities"] == 2
     assert verified.summary["fault_rejections"] == 4
-    assert verified.summary["promotion_allowed_scenarios"] == 8
+    assert verified.summary["promotion_allowed_scenarios"] == 9
+    assert verified.summary["stale_writer_rejections"] == 1
     assert set(path.name for path in root.iterdir()) == {
         "junit.xml",
         MANIFEST_NAME,
@@ -484,6 +621,60 @@ def test_round_trip_binds_observations_results_and_fixed_inventory(
         "results",
         "summary.json",
     }
+
+
+@pytest.mark.parametrize(
+    ("field_path", "replacement"),
+    [
+        (("control", "selected_ordinal"), 0),
+        (("control", "both_committed_before_publication"), False),
+        (("control", "publish_order"), [1, 0]),
+        (("control", "first_pointer_sha256_after_publish"), digest("forged")),
+        (("protected", "second_outcome"), "published"),
+        (("protected", "stale_orphan_preserved"), False),
+        (
+            ("protected", "second_generation_tree_sha256_after"),
+            digest("changed-tree"),
+        ),
+        (("recovery_after_publish", "recovery_outcome"), "published"),
+        (("rejections", "lineage_conflict"), "parent_version_invalid"),
+    ],
+)
+def test_generation_lineage_semantic_tampering_is_rejected(
+    field_path: tuple[str, str],
+    replacement: object,
+) -> None:
+    observation = lineage_observation()
+    section = observation[field_path[0]]
+    assert isinstance(section, dict)
+    section[field_path[1]] = replacement
+
+    with pytest.raises(EvidenceArtifactError):
+        normalize_observation(observation)
+
+
+def test_generation_lineage_matched_tree_tampering_is_rejected() -> None:
+    observation = lineage_observation()
+    control = observation["control"]
+    assert isinstance(control, dict)
+    changed = digest("matched-tree-tamper")
+    control["first_generation_tree_sha256_before"] = changed
+    control["first_generation_tree_sha256_after"] = changed
+
+    with pytest.raises(EvidenceArtifactError, match="matched generation trees"):
+        normalize_observation(observation)
+
+
+def test_generation_lineage_recovery_tree_tampering_is_rejected() -> None:
+    observation = lineage_observation()
+    recovery = observation["recovery_after_publish"]
+    assert isinstance(recovery, dict)
+    changed = digest("recovery-tree-tamper")
+    recovery["generation_tree_sha256_before"] = changed
+    recovery["generation_tree_sha256_after"] = changed
+
+    with pytest.raises(EvidenceArtifactError, match="recovery tree"):
+        normalize_observation(observation)
 
 
 def test_results_are_derived_from_observations_not_caller_hashes(
@@ -706,7 +897,7 @@ def test_dtensor_observation_rejects_global_inequality() -> None:
 def test_promotion_pointer_must_bind_receipt_and_canonical_bytes() -> None:
     value = training_observation("training_1_to_2", 1, 2)
     value["promotion_pointer"]["generation"] = "b" * 64
-    with pytest.raises(EvidenceArtifactError, match="digest"):
+    with pytest.raises(EvidenceArtifactError, match="lineage|digest"):
         normalize_observation(value)
 
 

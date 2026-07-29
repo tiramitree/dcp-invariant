@@ -39,16 +39,17 @@ from .elastic_contract import (
     failure_marker_payload,
     is_registered_torch_version_pair,
 )
+from .supervisor import LATEST_SCHEMA, LINEAGE_SCHEMA
 
-ARTIFACT_SCHEMA = "dcp-invariant-evidence-v3"
-RESULT_SCHEMA = "dcp-invariant-scenario-result-v3"
-SUMMARY_SCHEMA = "dcp-invariant-summary-v3"
+ARTIFACT_SCHEMA = "dcp-invariant-evidence-v4"
+RESULT_SCHEMA = "dcp-invariant-scenario-result-v4"
+SUMMARY_SCHEMA = "dcp-invariant-summary-v4"
 TRAINING_OBSERVATION_SCHEMA = "dcp-invariant-training-observation-v1"
 DTENSOR_OBSERVATION_SCHEMA = "dcp-invariant-dtensor-observation-v1"
 FAULT_OBSERVATION_SCHEMA = "dcp-invariant-fault-observation-v1"
 ELASTIC_OBSERVATION_SCHEMA = "dcp-invariant-elastic-observation-v2"
+LINEAGE_OBSERVATION_SCHEMA = "dcp-invariant-generation-lineage-observation-v1"
 WORKER_REPORT_SCHEMA = "dcp-invariant-worker-report-v1"
-LATEST_SCHEMA = "dcp-invariant-latest-v1"
 MANIFEST_NAME = "manifest.sha256"
 MANIFEST_AUTHENTICATED = False
 
@@ -124,6 +125,13 @@ class ScenarioSpec:
     rejection_stage: str | None = None
 
     def registry_json(self) -> dict[str, Any]:
+        if self.category == "generation-lineage-stale-writer":
+            return {
+                "category": self.category,
+                "name": self.name,
+                "publisher_process_count": self.source_world_size,
+                "selected_head_count": self.target_world_size,
+            }
         return {
             "category": self.category,
             "name": self.name,
@@ -145,6 +153,12 @@ SCENARIO_SPECS = (
         "elastic-restart-exact-state",
         2,
         2,
+    ),
+    ScenarioSpec(
+        "generation_lineage_stale_writer_2p",
+        "generation-lineage-stale-writer",
+        2,
+        1,
     ),
     ScenarioSpec(
         "rank_exit_no_promotion",
@@ -196,6 +210,11 @@ _ELASTIC_SCENARIOS = frozenset(
     spec.name
     for spec in SCENARIO_SPECS
     if spec.category == "elastic-restart-exact-state"
+)
+_LINEAGE_SCENARIOS = frozenset(
+    spec.name
+    for spec in SCENARIO_SPECS
+    if spec.category == "generation-lineage-stale-writer"
 )
 _FAULT_SCENARIOS = frozenset(
     spec.name for spec in SCENARIO_SPECS if spec.category == "fault-rejection"
@@ -431,30 +450,75 @@ def _require_report_consensus(
             raise EvidenceArtifactError(f"rank reports disagree on {field}")
 
 
-def _pointer_digest(generation: str) -> str:
-    return hashlib.sha256(
-        (
-            canonical_json(
-                {
-                    "generation": generation,
-                    "pointer_schema": LATEST_SCHEMA,
-                }
-            )
-            + "\n"
-        ).encode("utf-8")
-    ).hexdigest()
+def _lineage_digest(
+    *,
+    generation: str,
+    checkpoint_id: str,
+    parent_pointer_sha256: str | None,
+    sequence: int,
+) -> str:
+    value = {
+        "generation": generation,
+        "lineage_schema": LINEAGE_SCHEMA,
+        "logical_checkpoint_id": checkpoint_id,
+        "parent_pointer_sha256": parent_pointer_sha256,
+        "sequence": sequence,
+    }
+    return hashlib.sha256((canonical_json(value) + "\n").encode("utf-8")).hexdigest()
 
 
-def _validate_pointer(value: object, label: str) -> dict[str, Any]:
+def _validate_pointer(
+    value: object,
+    label: str,
+    *,
+    checkpoint_id: str,
+) -> dict[str, Any]:
     pointer = _expect_exact_fields(
         value,
-        frozenset({"generation", "pointer_schema", "pointer_sha256"}),
+        frozenset(
+            {
+                "generation",
+                "lineage_sha256",
+                "parent_pointer_sha256",
+                "pointer_schema",
+                "pointer_sha256",
+                "sequence",
+            }
+        ),
         label,
     )
     generation = _require_sha256(pointer["generation"], f"{label} generation")
+    lineage = _require_sha256(pointer["lineage_sha256"], f"{label} lineage")
+    parent = pointer["parent_pointer_sha256"]
+    if parent is not None:
+        parent = _require_sha256(parent, f"{label} parent")
+    sequence = pointer["sequence"]
+    if (
+        type(sequence) is not int
+        or not (0 <= sequence <= (2**63 - 1))
+        or (sequence > 0 and parent is None)
+    ):
+        raise EvidenceArtifactError(f"{label} sequence is invalid")
     _expect_exact(pointer["pointer_schema"], LATEST_SCHEMA, f"{label} schema")
+    if lineage != _lineage_digest(
+        generation=generation,
+        checkpoint_id=checkpoint_id,
+        parent_pointer_sha256=parent,
+        sequence=sequence,
+    ):
+        raise EvidenceArtifactError(f"{label} lineage does not match its fields")
     pointer_sha256 = _require_sha256(pointer["pointer_sha256"], f"{label} digest")
-    if pointer_sha256 != _pointer_digest(generation):
+    payload = {
+        "generation": generation,
+        "lineage_sha256": lineage,
+        "parent_pointer_sha256": parent,
+        "pointer_schema": LATEST_SCHEMA,
+        "sequence": sequence,
+    }
+    expected_pointer = hashlib.sha256(
+        (canonical_json(payload) + "\n").encode("utf-8")
+    ).hexdigest()
+    if pointer_sha256 != expected_pointer:
         raise EvidenceArtifactError(f"{label} digest does not match its fields")
     return pointer
 
@@ -484,7 +548,11 @@ def _validate_positive_common(
     )
     _expect_exact(observation["checkpoint_id"], checkpoint_id, "checkpoint identifier")
     receipt = _require_sha256(observation["receipt_sha256"], "checkpoint receipt")
-    pointer = _validate_pointer(observation["promotion_pointer"], "promotion pointer")
+    pointer = _validate_pointer(
+        observation["promotion_pointer"],
+        "promotion pointer",
+        checkpoint_id=checkpoint_id,
+    )
     if pointer["generation"] != receipt:
         raise EvidenceArtifactError("promotion generation does not match receipt")
     _expect_exact(
@@ -909,10 +977,12 @@ def _validate_elastic_observation(
     pointer_before = _validate_pointer(
         observation["promotion_pointer_before"],
         "promotion pointer before elastic restart",
+        checkpoint_id="checkpoint-one",
     )
     pointer_after = _validate_pointer(
         observation["promotion_pointer_after"],
         "promotion pointer after elastic restart",
+        checkpoint_id="checkpoint-one",
     )
     if not exact_json_equal(pointer_before, pointer_after):
         raise EvidenceArtifactError("promotion pointer changed during elastic restart")
@@ -999,10 +1069,12 @@ def _validate_fault_pointer_pair(observation: Mapping[str, Any]) -> None:
     before = _validate_pointer(
         observation["promotion_pointer_before"],
         "promotion pointer before fault",
+        checkpoint_id="checkpoint-one",
     )
     after = _validate_pointer(
         observation["promotion_pointer_after"],
         "promotion pointer after fault",
+        checkpoint_id="checkpoint-one",
     )
     if not exact_json_equal(before, after):
         raise EvidenceArtifactError("promotion pointer changed after rejected fault")
@@ -1368,6 +1440,444 @@ def _validate_async_observation(
     return normalized, result
 
 
+def _validate_lineage_worker(
+    value: object,
+    *,
+    expected_exit_codes: list[int],
+    label: str,
+) -> dict[str, Any]:
+    worker = _expect_exact_fields(
+        value,
+        frozenset({"exit_codes", "timed_out"}),
+        label,
+    )
+    _expect_exact(worker["exit_codes"], expected_exit_codes, f"{label} exits")
+    _expect_exact(worker["timed_out"], False, f"{label} timeout")
+    return worker
+
+
+def _validate_lineage_arm(
+    value: object,
+    *,
+    mode: str,
+) -> dict[str, Any]:
+    fields = frozenset(
+        {
+            "both_committed_before_publication",
+            "committed_generation_count",
+            "final_generation_sha256",
+            "final_pointer",
+            "first_generation_sha256",
+            "first_generation_tree_sha256_after",
+            "first_generation_tree_sha256_before",
+            "first_lineage_sha256",
+            "first_outcome",
+            "first_pointer_sha256_after_publish",
+            "generation_bytes_unchanged",
+            "publish_order",
+            "reference_overwrite_observed",
+            "second_generation_sha256",
+            "second_generation_tree_sha256_after",
+            "second_generation_tree_sha256_before",
+            "second_lineage_sha256",
+            "second_outcome",
+            "selected_ordinal",
+            "starting_pointer",
+            "stale_orphan_preserved",
+            "stale_writer_rejected",
+            "worker",
+        }
+    )
+    arm = _expect_exact_fields(value, fields, f"{mode} lineage arm")
+    _expect_exact(
+        arm["committed_generation_count"],
+        3,
+        f"{mode} committed count",
+    )
+    _expect_exact(
+        arm["both_committed_before_publication"],
+        True,
+        f"{mode} commit barrier",
+    )
+    _expect_exact(arm["publish_order"], [0, 1], f"{mode} publish order")
+    starting = _validate_pointer(
+        arm["starting_pointer"],
+        f"{mode} starting pointer",
+        checkpoint_id="checkpoint-one",
+    )
+    _expect_exact(starting["sequence"], 0, f"{mode} starting sequence")
+    _expect_exact(
+        starting["parent_pointer_sha256"],
+        None,
+        f"{mode} starting parent",
+    )
+    first = _require_sha256(
+        arm["first_generation_sha256"],
+        f"{mode} first generation",
+    )
+    second = _require_sha256(
+        arm["second_generation_sha256"],
+        f"{mode} second generation",
+    )
+    if first == second:
+        raise EvidenceArtifactError(f"{mode} generations are not distinct")
+    if starting["generation"] in {first, second}:
+        raise EvidenceArtifactError(f"{mode} seed and child generations overlap")
+    first_lineage = _require_sha256(
+        arm["first_lineage_sha256"],
+        f"{mode} first lineage",
+    )
+    second_lineage = _require_sha256(
+        arm["second_lineage_sha256"],
+        f"{mode} second lineage",
+    )
+    parent_sha256 = starting["pointer_sha256"]
+    child_sequence = starting["sequence"] + 1
+    if first_lineage != _lineage_digest(
+        generation=first,
+        checkpoint_id="checkpoint-one",
+        parent_pointer_sha256=parent_sha256,
+        sequence=child_sequence,
+    ):
+        raise EvidenceArtifactError(f"{mode} first lineage is invalid")
+    if second_lineage != _lineage_digest(
+        generation=second,
+        checkpoint_id="checkpoint-one",
+        parent_pointer_sha256=parent_sha256,
+        sequence=child_sequence,
+    ):
+        raise EvidenceArtifactError(f"{mode} second lineage is invalid")
+    first_before = _require_sha256(
+        arm["first_generation_tree_sha256_before"],
+        f"{mode} first tree before",
+    )
+    first_after = _require_sha256(
+        arm["first_generation_tree_sha256_after"],
+        f"{mode} first tree after",
+    )
+    second_before = _require_sha256(
+        arm["second_generation_tree_sha256_before"],
+        f"{mode} second tree before",
+    )
+    second_after = _require_sha256(
+        arm["second_generation_tree_sha256_after"],
+        f"{mode} second tree after",
+    )
+    if first_before != first_after or second_before != second_after:
+        raise EvidenceArtifactError(f"{mode} committed generation bytes changed")
+    _expect_exact(
+        arm["generation_bytes_unchanged"],
+        True,
+        f"{mode} generation byte equality",
+    )
+    pointer = _validate_pointer(
+        arm["final_pointer"],
+        f"{mode} final pointer",
+        checkpoint_id="checkpoint-one",
+    )
+    _expect_exact(pointer["sequence"], child_sequence, f"{mode} final sequence")
+    _expect_exact(
+        pointer["parent_pointer_sha256"],
+        parent_sha256,
+        f"{mode} final parent",
+    )
+    first_pointer_payload = {
+        "generation": first,
+        "lineage_sha256": first_lineage,
+        "parent_pointer_sha256": parent_sha256,
+        "pointer_schema": LATEST_SCHEMA,
+        "sequence": child_sequence,
+    }
+    first_pointer_sha256 = hashlib.sha256(
+        (canonical_json(first_pointer_payload) + "\n").encode("utf-8")
+    ).hexdigest()
+    _expect_exact(
+        arm["first_pointer_sha256_after_publish"],
+        first_pointer_sha256,
+        f"{mode} first published pointer",
+    )
+    final_generation = _require_sha256(
+        arm["final_generation_sha256"],
+        f"{mode} final generation",
+    )
+    if pointer["generation"] != final_generation:
+        raise EvidenceArtifactError(f"{mode} final pointer differs from result")
+    _validate_lineage_worker(
+        arm["worker"],
+        expected_exit_codes=[0, 0],
+        label=f"{mode} lineage worker",
+    )
+    if mode == "control":
+        expected = {
+            "first_outcome": "published_unfenced",
+            "reference_overwrite_observed": True,
+            "second_outcome": "published_unfenced",
+            "selected_ordinal": 1,
+            "stale_orphan_preserved": False,
+            "stale_writer_rejected": False,
+        }
+        selected = second
+        selected_lineage = second_lineage
+    elif mode == "protected":
+        expected = {
+            "first_outcome": "published",
+            "reference_overwrite_observed": False,
+            "second_outcome": "stale_parent",
+            "selected_ordinal": 0,
+            "stale_orphan_preserved": True,
+            "stale_writer_rejected": True,
+        }
+        selected = first
+        selected_lineage = first_lineage
+    else:
+        raise EvidenceArtifactError("lineage arm mode is not registered")
+    for field, expected_value in expected.items():
+        _expect_exact(arm[field], expected_value, f"{mode} {field}")
+    if final_generation != selected:
+        raise EvidenceArtifactError(f"{mode} selected generation is invalid")
+    if pointer["lineage_sha256"] != selected_lineage:
+        raise EvidenceArtifactError(f"{mode} selected lineage is invalid")
+    if mode == "control" and pointer["pointer_sha256"] == first_pointer_sha256:
+        raise EvidenceArtifactError("control did not overwrite the first pointer")
+    if mode == "protected" and (pointer["pointer_sha256"] != first_pointer_sha256):
+        raise EvidenceArtifactError("protected arm did not preserve the first pointer")
+    return arm
+
+
+def _validate_lineage_recovery(
+    value: object,
+    *,
+    mode: str,
+) -> dict[str, Any]:
+    recovery = _expect_exact_fields(
+        value,
+        frozenset(
+            {
+                "exit_code",
+                "generation_bytes_unchanged",
+                "generation_sha256",
+                "generation_tree_sha256_after",
+                "generation_tree_sha256_before",
+                "outcome_before_exit",
+                "pointer_after_retry",
+                "pointer_unchanged_on_retry",
+                "recovery_outcome",
+                "starting_pointer",
+                "worker",
+            }
+        ),
+        f"{mode} recovery",
+    )
+    if mode == "after-commit":
+        exit_code = 73
+        before = "committed"
+        outcome = "published"
+        pointer_unchanged = False
+    elif mode == "after-publish":
+        exit_code = 74
+        before = "publication_return_lost"
+        outcome = "already_published"
+        pointer_unchanged = True
+    else:
+        raise EvidenceArtifactError("lineage recovery mode is not registered")
+    _expect_exact(recovery["exit_code"], exit_code, f"{mode} exit")
+    _expect_exact(recovery["outcome_before_exit"], before, f"{mode} pre-exit")
+    _expect_exact(recovery["recovery_outcome"], outcome, f"{mode} recovery outcome")
+    _expect_exact(
+        recovery["pointer_unchanged_on_retry"],
+        pointer_unchanged,
+        f"{mode} pointer equality",
+    )
+    _expect_exact(
+        recovery["generation_bytes_unchanged"],
+        True,
+        f"{mode} generation byte equality",
+    )
+    before_tree = _require_sha256(
+        recovery["generation_tree_sha256_before"],
+        f"{mode} tree before",
+    )
+    after_tree = _require_sha256(
+        recovery["generation_tree_sha256_after"],
+        f"{mode} tree after",
+    )
+    if before_tree != after_tree:
+        raise EvidenceArtifactError(f"{mode} recovery changed committed bytes")
+    generation = _require_sha256(
+        recovery["generation_sha256"],
+        f"{mode} generation",
+    )
+    pointer = _validate_pointer(
+        recovery["pointer_after_retry"],
+        f"{mode} pointer after retry",
+        checkpoint_id="checkpoint-one",
+    )
+    starting = _validate_pointer(
+        recovery["starting_pointer"],
+        f"{mode} starting pointer",
+        checkpoint_id="checkpoint-one",
+    )
+    _expect_exact(starting["sequence"], 0, f"{mode} starting sequence")
+    _expect_exact(starting["parent_pointer_sha256"], None, f"{mode} starting parent")
+    _expect_exact(pointer["sequence"], 1, f"{mode} recovered sequence")
+    _expect_exact(
+        pointer["parent_pointer_sha256"],
+        starting["pointer_sha256"],
+        f"{mode} recovered parent",
+    )
+    if pointer["generation"] != generation:
+        raise EvidenceArtifactError(f"{mode} pointer selected another generation")
+    _validate_lineage_worker(
+        recovery["worker"],
+        expected_exit_codes=[exit_code],
+        label=f"{mode} recovery worker",
+    )
+    return recovery
+
+
+def _validate_lineage_rejections(value: object) -> dict[str, Any]:
+    rejection = _expect_exact_fields(
+        value,
+        frozenset(
+            {
+                "candidates_preserved",
+                "forged_parent",
+                "lineage_conflict",
+                "pointers_unchanged",
+                "sequence_mismatch",
+            }
+        ),
+        "lineage rejections",
+    )
+    _expect_exact(rejection["candidates_preserved"], True, "candidate preservation")
+    _expect_exact(rejection["pointers_unchanged"], True, "rejection pointer equality")
+    _expect_exact(
+        rejection["forged_parent"],
+        "parent_version_invalid",
+        "forged parent rejection",
+    )
+    _expect_exact(
+        rejection["sequence_mismatch"],
+        "parent_version_invalid",
+        "sequence mismatch rejection",
+    )
+    _expect_exact(
+        rejection["lineage_conflict"],
+        "generation_lineage_conflict",
+        "lineage conflict rejection",
+    )
+    return rejection
+
+
+def _validate_generation_lineage_observation(
+    value: object,
+    spec: ScenarioSpec,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    observation = _expect_exact_fields(
+        value,
+        frozenset(
+            {
+                "control",
+                "observation_schema",
+                "publisher_process_count",
+                "protected",
+                "recovery_after_commit",
+                "recovery_after_publish",
+                "rejections",
+                "scenario",
+                "selected_head_count",
+            }
+        ),
+        spec.name,
+    )
+    _expect_exact(
+        observation["observation_schema"],
+        LINEAGE_OBSERVATION_SCHEMA,
+        "lineage observation schema",
+    )
+    _expect_exact(observation["scenario"], spec.name, "lineage scenario")
+    _expect_exact(
+        observation["publisher_process_count"],
+        spec.source_world_size,
+        "lineage publisher process count",
+    )
+    _expect_exact(
+        observation["selected_head_count"],
+        spec.target_world_size,
+        "lineage selected pointer-head count",
+    )
+    control = _validate_lineage_arm(observation["control"], mode="control")
+    protected = _validate_lineage_arm(
+        observation["protected"],
+        mode="protected",
+    )
+    if (
+        control["first_generation_sha256"] != protected["first_generation_sha256"]
+        or control["second_generation_sha256"] != protected["second_generation_sha256"]
+    ):
+        raise EvidenceArtifactError("lineage arms did not use matched generations")
+    if not exact_json_equal(
+        control["starting_pointer"],
+        protected["starting_pointer"],
+    ):
+        raise EvidenceArtifactError("lineage arms did not use a matched parent")
+    if (
+        control["first_lineage_sha256"] != protected["first_lineage_sha256"]
+        or control["second_lineage_sha256"] != protected["second_lineage_sha256"]
+    ):
+        raise EvidenceArtifactError("lineage arms did not use matched lineages")
+    matched_tree_fields = (
+        "first_generation_tree_sha256_before",
+        "first_generation_tree_sha256_after",
+        "second_generation_tree_sha256_before",
+        "second_generation_tree_sha256_after",
+    )
+    if any(control[field] != protected[field] for field in matched_tree_fields):
+        raise EvidenceArtifactError("lineage arms did not use matched generation trees")
+    committed_recovery = _validate_lineage_recovery(
+        observation["recovery_after_commit"],
+        mode="after-commit",
+    )
+    published_recovery = _validate_lineage_recovery(
+        observation["recovery_after_publish"],
+        mode="after-publish",
+    )
+    for recovery in (committed_recovery, published_recovery):
+        if not exact_json_equal(
+            recovery["starting_pointer"],
+            protected["starting_pointer"],
+        ):
+            raise EvidenceArtifactError("lineage recovery parent is not matched")
+        if (
+            recovery["generation_tree_sha256_before"]
+            != protected["first_generation_tree_sha256_before"]
+            or recovery["generation_tree_sha256_after"]
+            != protected["first_generation_tree_sha256_after"]
+        ):
+            raise EvidenceArtifactError("lineage recovery tree is not matched")
+    if (
+        committed_recovery["generation_sha256"] != protected["first_generation_sha256"]
+        or published_recovery["generation_sha256"]
+        != protected["first_generation_sha256"]
+    ):
+        raise EvidenceArtifactError("lineage recovery generation is not matched")
+    _validate_lineage_rejections(observation["rejections"])
+    normalized = strict_json_loads(canonical_json(observation))
+    result = {
+        "contract_status": "pass",
+        "control_selected_generation_sha256": control["final_generation_sha256"],
+        "observation_sha256": sha256_json(normalized),
+        "promotion_allowed": True,
+        "protected_selected_generation_sha256": protected["final_generation_sha256"],
+        "publisher_process_count": spec.source_world_size,
+        "result_schema": RESULT_SCHEMA,
+        "scenario": spec.name,
+        "selected_head_count": spec.target_world_size,
+        "stale_writer_rejections": 1,
+    }
+    return normalized, result
+
+
 def normalize_observation(
     value: Mapping[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -1384,6 +1894,8 @@ def normalize_observation(
         observation, result = _validate_dtensor_observation(value, spec)
     elif spec.name in _ELASTIC_SCENARIOS:
         observation, result = _validate_elastic_observation(value, spec)
+    elif spec.name in _LINEAGE_SCENARIOS:
+        observation, result = _validate_generation_lineage_observation(value, spec)
     else:
         observation, result = _validate_fault_observation(value, spec)
     _assert_no_sensitive_shape(observation)
@@ -1579,6 +2091,7 @@ def _build_summary(
             }
             for spec in SCENARIO_SPECS
         ],
+        "stale_writer_rejections": len(_LINEAGE_SCENARIOS),
         "state_equalities": len(_TRAINING_SCENARIOS),
     }
 
@@ -1854,7 +2367,7 @@ def build_evidence_artifact(
     numpy_version: str,
     observations: Mapping[str, Mapping[str, Any]],
 ) -> VerifiedArtifact:
-    """Build the exact v3 artifact from validated execution observations."""
+    """Build the exact v4 artifact from validated execution observations."""
 
     if not isinstance(root, Path):
         raise EvidenceArtifactError("artifact root must be a pathlib.Path")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -8,6 +9,7 @@ import pytest
 
 from dcp_invariant.supervisor import (
     LATEST_SCHEMA,
+    LEGACY_LATEST_SCHEMA,
     SupervisorError,
     WorkerOutcomeError,
     minimal_worker_environment,
@@ -113,18 +115,22 @@ def test_successful_promotion_updates_pointer(tmp_path: Path) -> None:
         logical_checkpoint_id="checkpoint-one",
         verify=verify,
     )
-    import hashlib
-
     digest = hashlib.sha256(
         (target / "checkpoint-one" / "checkpoint-receipt.json").read_bytes()
     ).hexdigest()
     assert target == root / "committed" / digest
     assert target.is_dir()
     assert not candidate.exists()
+    lineage = target / "generation-lineage.json"
+    lineage_sha256 = hashlib.sha256(lineage.read_bytes()).hexdigest()
     assert json.loads((root / "LATEST.json").read_text(encoding="utf-8")) == {
         "generation": digest,
+        "lineage_sha256": lineage_sha256,
+        "parent_pointer_sha256": None,
         "pointer_schema": LATEST_SCHEMA,
+        "sequence": 0,
     }
+    assert json.loads(lineage.read_text(encoding="utf-8"))["generation"] == digest
 
 
 def test_async_checkpoint_can_use_receipt_bound_promotion(tmp_path: Path) -> None:
@@ -145,7 +151,11 @@ def test_async_checkpoint_can_use_receipt_bound_promotion(tmp_path: Path) -> Non
 def test_failed_verification_preserves_old_pointer(tmp_path: Path) -> None:
     root, candidate = promotion_root(tmp_path)
     previous = (
-        '{"generation":"' + ("b" * 64) + '","pointer_schema":"' + LATEST_SCHEMA + '"}\n'
+        '{"generation":"'
+        + ("b" * 64)
+        + '","pointer_schema":"'
+        + LEGACY_LATEST_SCHEMA
+        + '"}\n'
     )
     (root / "LATEST.json").write_text(previous, encoding="utf-8", newline="\n")
 
@@ -166,19 +176,18 @@ def test_failed_verification_preserves_old_pointer(tmp_path: Path) -> None:
 
 def test_existing_generation_is_not_overwritten(tmp_path: Path) -> None:
     root, candidate = promotion_root(tmp_path)
-    import hashlib
-
     digest = hashlib.sha256(
         (candidate / "checkpoint-one" / "checkpoint-receipt.json").read_bytes()
     ).hexdigest()
     (root / "committed" / digest).mkdir()
-    with pytest.raises(SupervisorError, match="already exists"):
+    with pytest.raises(SupervisorError):
         promote_candidate(
             root=root,
             candidate=candidate,
             logical_checkpoint_id="checkpoint-one",
             verify=lambda path: True,
         )
+    assert candidate.is_dir()
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="symlink privilege varies")
@@ -215,8 +224,6 @@ def test_false_verifier_result_cannot_promote(tmp_path: Path) -> None:
 
 
 def test_receipt_digest_names_generation(tmp_path: Path) -> None:
-    import hashlib
-
     root, candidate = promotion_root(tmp_path)
     expected = hashlib.sha256(
         (candidate / "checkpoint-one" / "checkpoint-receipt.json").read_bytes()
@@ -249,7 +256,7 @@ def test_invalid_existing_pointer_is_not_overwritten(tmp_path: Path) -> None:
 def test_candidate_wrapper_rejects_unregistered_sibling(tmp_path: Path) -> None:
     root, candidate = promotion_root(tmp_path)
     (candidate / "worker-report.json").write_text("{}\n", encoding="utf-8")
-    with pytest.raises(SupervisorError, match="contain only"):
+    with pytest.raises(SupervisorError, match="unregistered entry"):
         promote_candidate(
             root=root,
             candidate=candidate,

@@ -18,6 +18,7 @@ from dcp_invariant.suite import (
     _ensure_ordinary_output_parent,
     _read_async_reports,
     _read_reports,
+    _run_generation_lineage_scenario,
     _run_rank_exit_fault,
     _validate_async_report,
     _validate_rank_consensus,
@@ -220,11 +221,34 @@ def test_report_reader_requires_complete_canonical_rank_set(tmp_path: Path) -> N
 
 def test_seed_pointer_binds_canonical_pointer_bytes(tmp_path: Path) -> None:
     root = tmp_path / "promotion"
-    root.mkdir()
+    (root / "candidates").mkdir(parents=True)
+    (root / "committed").mkdir()
     pointer = _write_seed_pointer(root)
+    receipt = (
+        canonical_json(
+            {
+                "receipt_schema": "dcp-invariant-lineage-seed-v1",
+                "seed_ordinal": 0,
+            }
+        )
+        + "\n"
+    ).encode("utf-8")
+    generation = hashlib.sha256(receipt).hexdigest()
+    lineage = {
+        "generation": generation,
+        "lineage_schema": "dcp-invariant-generation-lineage-v1",
+        "logical_checkpoint_id": "checkpoint-one",
+        "parent_pointer_sha256": None,
+        "sequence": 0,
+    }
     expected = {
-        "generation": "0" * 64,
+        "generation": generation,
+        "lineage_sha256": hashlib.sha256(
+            (canonical_json(lineage) + "\n").encode("utf-8")
+        ).hexdigest(),
+        "parent_pointer_sha256": None,
         "pointer_schema": LATEST_SCHEMA,
+        "sequence": 0,
     }
     raw = (canonical_json(expected) + "\n").encode("utf-8")
 
@@ -233,6 +257,27 @@ def test_seed_pointer_binds_canonical_pointer_bytes(tmp_path: Path) -> None:
         "pointer_sha256": hashlib.sha256(raw).hexdigest(),
     }
     assert (root / "LATEST.json").read_bytes() == raw
+    target = root / "committed" / generation
+    assert (
+        target / "checkpoint-one" / "checkpoint-receipt.json"
+    ).read_bytes() == receipt
+
+
+def test_registered_two_process_lineage_scenario_is_deterministic(
+    tmp_path: Path,
+) -> None:
+    observation = _run_generation_lineage_scenario(
+        tmp_path / "lineage",
+        timeout_seconds=20.0,
+    )
+    normalized, result = normalize_observation(observation)
+
+    assert normalized == observation
+    assert result["contract_status"] == "pass"
+    assert result["stale_writer_rejections"] == 1
+    assert observation["control"]["selected_ordinal"] == 1
+    assert observation["protected"]["selected_ordinal"] == 0
+    assert observation["protected"]["second_outcome"] == "stale_parent"
 
 
 def test_injected_rank_exit_preserves_candidate_and_pointer(
@@ -308,8 +353,8 @@ def test_live_registered_suite_has_no_native_public_files(tmp_path: Path) -> Non
     )
 
     assert result.native_work_cleaned is True
-    assert result.artifact.summary["passed_scenarios"] == 12
-    assert len(result.observations) == 12
+    assert result.artifact.summary["passed_scenarios"] == 13
+    assert len(result.observations) == 13
     assert not [
         path
         for path in output.rglob("*")
