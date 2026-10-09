@@ -32,6 +32,7 @@ from .async_snapshot_contract import (
 )
 from .canonical import canonical_json, strict_json_loads
 from .checkpoint_receipt import build_receipt, verify_checkpoint, write_receipt
+from .filesystem import rename_no_replace
 from .state import normalized_digest
 from .worker import initialize_process_group
 
@@ -337,10 +338,9 @@ def _write_async_report(
             output.write(encoded)
             output.flush()
             os.fsync(output.fileno())
-        os.replace(pending, target)
-    finally:
-        if pending.exists():
-            pending.unlink()
+        rename_no_replace(pending, target)
+    except OSError as error:
+        raise AsyncSnapshotWorkerError("async report publication failed") from error
     return target
 
 

@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from .canonical import canonical_json, exact_json_equal, strict_json_loads
+from .filesystem import rename_no_replace
 
 RECEIPT_NAME = "checkpoint-receipt.json"
 RECEIPT_SCHEMA = "dcp-invariant-checkpoint-receipt-v1"
@@ -196,11 +197,12 @@ def write_receipt(root: Path, receipt: dict[str, Any]) -> None:
             output.write(encoded)
             output.flush()
             os.fsync(output.fileno())
-        os.replace(temporary, target)
+        rename_no_replace(temporary, target)
         _fsync_directory(root)
-    finally:
-        if temporary.exists():
-            temporary.unlink()
+    except OSError as error:
+        raise CheckpointReceiptError(
+            "receipt could not be published durably"
+        ) from error
 
 
 def _parse_receipt(root: Path) -> dict[str, Any]:

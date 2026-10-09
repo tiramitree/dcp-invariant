@@ -19,6 +19,7 @@ from pathlib import Path
 
 from .canonical import canonical_json, strict_json_loads
 from .checkpoint_receipt import RECEIPT_NAME
+from .filesystem import rename_no_replace
 
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 LEGACY_LATEST_SCHEMA = "dcp-invariant-latest-v1"
@@ -796,7 +797,7 @@ def commit_candidate(
         _write_exclusive(record_path, encoded, label="generation lineage record")
         created_lineage = True
     try:
-        candidate.rename(target)
+        rename_no_replace(candidate, target)
     except OSError as error:
         collision = error.errno in {errno.EEXIST, errno.ENOTEMPTY}
         if not collision or not _entry_exists(target):

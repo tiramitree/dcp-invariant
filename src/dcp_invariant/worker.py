@@ -23,6 +23,7 @@ from .checkpoint_receipt import (
     verify_checkpoint,
     write_receipt,
 )
+from .filesystem import rename_no_replace
 from .state import (
     BIAS_SHAPE,
     GLOBAL_BATCH_SHAPE,
@@ -459,10 +460,9 @@ def write_report(report_dir: Path, *, rank: int, report: dict[str, Any]) -> Path
             output.write(encoded)
             output.flush()
             os.fsync(output.fileno())
-        os.replace(pending, target)
-    finally:
-        if pending.exists():
-            pending.unlink()
+        rename_no_replace(pending, target)
+    except OSError as error:
+        raise WorkerContractError("worker report publication failed") from error
     return target
 
 

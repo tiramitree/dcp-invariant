@@ -22,6 +22,7 @@ from .elastic_contract import (
     failure_marker_payload,
     parse_elastic_environment,
 )
+from .filesystem import rename_no_replace
 
 _MARKER_MAX_BYTES = 4096
 
@@ -169,10 +170,11 @@ def _write_control_report(
             output.write(raw)
             output.flush()
             os.fsync(output.fileno())
-        os.replace(pending, target)
-    finally:
-        if pending.exists():
-            pending.unlink()
+        rename_no_replace(pending, target)
+    except OSError as error:
+        raise ElasticWorkerContractError(
+            "elastic control report publication failed"
+        ) from error
     return target
 
 
