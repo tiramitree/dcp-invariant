@@ -9,7 +9,7 @@ from unittest import mock
 
 import pytest
 
-from dcp_invariant import async_snapshot_worker, elastic_worker, worker
+from dcp_invariant import elastic_worker
 from dcp_invariant.elastic_contract import ElasticEnvironment
 
 
@@ -28,6 +28,9 @@ def report_writer(request, tmp_path: Path):
 
         error_type = elastic_worker.ElasticWorkerContractError
     elif request.param == "async":
+        pytest.importorskip("torch")
+        from dcp_invariant import async_snapshot_worker
+
         root = tmp_path
 
         def write():
@@ -43,6 +46,9 @@ def report_writer(request, tmp_path: Path):
 
         error_type = async_snapshot_worker.AsyncSnapshotWorkerError
     else:
+        pytest.importorskip("torch")
+        from dcp_invariant import worker
+
         root = tmp_path
 
         def write():
